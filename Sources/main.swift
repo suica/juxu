@@ -6,7 +6,7 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let bundle = Bundle.main
-        let bundleId = bundle.bundleIdentifier ?? "com.hcyue.juxu.inputmethod"
+        let bundleId = bundle.bundleIdentifier ?? "com.hcyue.inputmethod.juxu"
 
         // On macOS 27+, `+[IMKServer connectionNameFor:]` enforces `<bundleIdentifier>.Connection`
         // for all third-party input methods (rejecting custom names in IMKInputSession_Modern).

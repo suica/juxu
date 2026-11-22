@@ -11,7 +11,7 @@
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.hcyue.juxu.inputmethod</string>
+    <string>com.hcyue.inputmethod.juxu</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -37,7 +37,7 @@
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>句序仅在你选择 Apple 本地语音识别时使用系统语音识别能力。</string>
     <key>InputMethodConnectionName</key>
-    <string>com.hcyue.juxu.inputmethod.Connection</string>
+    <string>com.hcyue.inputmethod.juxu.Connection</string>
     <key>InputMethodServerControllerClass</key>
     <string>JuxuInputController</string>
     <key>InputMethodServerDelegateClass</key>
@@ -56,10 +56,10 @@
     <dict>
         <key>tsInputModeListKey</key>
         <dict>
-            <key>com.hcyue.juxu.inputmethod.juxu</key>
+            <key>com.hcyue.inputmethod.juxu.juxu</key>
             <dict>
                 <key>TISInputSourceID</key>
-                <string>com.hcyue.juxu.inputmethod.juxu</string>
+                <string>com.hcyue.inputmethod.juxu.juxu</string>
                 <key>tsInputModeMenuIconFileKey</key>
                 <string>menu_icon.pdf</string>
                 <key>tsInputModeAlternateMenuIconFileKey</key>
@@ -78,7 +78,7 @@
         </dict>
         <key>tsVisibleInputModeOrderedArrayKey</key>
         <array>
-            <string>com.hcyue.juxu.inputmethod.juxu</string>
+            <string>com.hcyue.inputmethod.juxu.juxu</string>
         </array>
     </dict>
 </dict>
