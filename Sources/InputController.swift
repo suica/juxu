@@ -102,8 +102,10 @@ public final class JuxuInputController: IMKInputController {
 
         // Strictly on-demand voice entry: when disabled, zero voice controllers or panels are loaded.
         if VoiceGlobalHotkeyController.isListening {
-            // The global listener already saw this key; only keep typing out of a recording.
-            if event.type == .keyDown, VoiceSessionController.sharedIfLoaded?.isRecording == true {
+            // The global listener already saw this key. Esc must not also reach the app;
+            // any other key is a shortcut and has to pass through.
+            if event.type == .keyDown, event.keyCode == 0x35,
+               VoiceSessionController.sharedIfLoaded?.isCapturing == true {
                 return true
             }
         } else if VoicePreferencesStore.shared.prefs.enabled {
