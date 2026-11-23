@@ -56,7 +56,7 @@ public final class VoiceLocalInstaller: ObservableObject {
         _shared = nil
     }
 
-    public static var modelsDirectory: URL {
+    nonisolated public static var modelsDirectory: URL {
         URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Library/Application Support/Juxu/VoiceModels", isDirectory: true)
     }
@@ -114,6 +114,17 @@ public final class VoiceLocalInstaller: ObservableObject {
     }
 
     public static func asrStatus(for preset: VoiceLocalASRModelPreset) -> VoiceLocalComponentStatus {
+        if let pinned = preset.descriptor.pinned {
+            let dependency = VoiceASRRegistry.dependencyPath(for: preset)
+            let installed = pinned.isInstalled(at: pinned.directory)
+            return VoiceLocalComponentStatus(
+                dependencyInstalled: dependency != nil,
+                dependencyPath: dependency,
+                modelInstalled: installed,
+                modelPath: pinned.directory.path,
+                modelSizeBytes: installed ? pinned.totalBytes : 0
+            )
+        }
         guard let filename = preset.modelFilename else {
             return VoiceLocalComponentStatus(
                 dependencyInstalled: true,
@@ -169,6 +180,10 @@ public final class VoiceLocalInstaller: ObservableObject {
 
     public func installASR(preset: VoiceLocalASRModelPreset) {
         guard !phase.isBusy, let filename = preset.modelFilename else { return }
+        if let pinned = preset.descriptor.pinned {
+            installPinnedModel(pinned, displayName: preset.displayName)
+            return
+        }
         let urls = preset.downloadURLs
         let displayName = preset.displayName
 
@@ -194,6 +209,41 @@ public final class VoiceLocalInstaller: ObservableObject {
 
                 self.refreshToken += 1
                 self.phase = .completed("✓ \(displayName) 与依赖已就绪，现在即可语音输入")
+            } catch is CancellationError {
+                self.phase = .idle
+            } catch {
+                self.phase = .failed(error.localizedDescription)
+            }
+            self.activeTask = nil
+        }
+    }
+
+    /// Downloads a pinned revision file by file and verifies every SHA-256 before use.
+    private func installPinnedModel(_ pinned: VoicePinnedModel, displayName: String) {
+        activeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let directory = pinned.directory
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try? FileManager.default.removeItem(at: pinned.markerURL(in: directory))
+                for file in pinned.files {
+                    try Task.checkCancellation()
+                    let destination = directory.appendingPathComponent(file.name)
+                    if await pinned.matches(file, at: destination) { continue }
+                    try await self.downloadModelWithFallback(
+                        urls: pinned.downloadURLs(for: file),
+                        destination: destination,
+                        displayName: "\(displayName) · \(file.name)"
+                    )
+                    self.phase = .downloadingModel(name: displayName, progress: 1, detail: "校验 \(file.name)…")
+                    guard await pinned.matches(file, at: destination) else {
+                        try? FileManager.default.removeItem(at: destination)
+                        throw VoiceEngineError.cliFailed("\(file.name) 校验失败，已删除，请重试")
+                    }
+                }
+                try pinned.writeMarker(in: directory)
+                self.refreshToken += 1
+                self.phase = .completed("✓ \(displayName) 已就绪，现在即可语音输入")
             } catch is CancellationError {
                 self.phase = .idle
             } catch {
@@ -419,7 +469,7 @@ private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate,
     func start(url: URL) {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 30
-        cfg.timeoutIntervalForResource = 1800
+        cfg.timeoutIntervalForResource = 6 * 3600
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         self.session = s
         let t = s.downloadTask(with: url)

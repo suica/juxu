@@ -28,7 +28,7 @@ public final class VoiceSessionController {
         _shared?.teardown()
         _shared = nil
         VoiceHUDPanelController.unload()
-        VoiceWhisperServerManager.unload()
+        VoiceASRRegistry.unloadAll()
     }
 
     private enum Phase {
@@ -200,8 +200,8 @@ public final class VoiceSessionController {
             return (true, "云端识别配置就绪（\(prefs.effectiveCloudASRModel)）")
 
         case .local:
-            switch prefs.localASRPreset {
-            case .whisperTurbo, .whisperBase:
+            switch prefs.localASRPreset.backend {
+            case .engine:
                 let status = VoiceLocalInstaller.asrStatus(for: prefs.localASRPreset)
                 if !status.isReady {
                     return (false, "尚未安装 \(prefs.localASRPreset.displayName)，请点击上方「一键下载并安装」")
@@ -321,7 +321,7 @@ public final class VoiceSessionController {
                 self.phase = .recording
                 self.recordingStartTime = Date()
                 self.sessionGeneration &+= 1
-                self.startWhisperStreamIfAvailable(prefs: prefs, recorder: recorder)
+                self.startEngineStreamIfAvailable(prefs: prefs, recorder: recorder)
                 self.startHUDTimer()
                 self.refreshRecordingHUD()
             } catch {
@@ -331,16 +331,10 @@ public final class VoiceSessionController {
         }
     }
 
-    /// Starts resident-model partials for local Whisper. If unavailable, dictation simply uses the CLI on release.
-    private func startWhisperStreamIfAvailable(prefs: VoicePreferences, recorder: VoiceAudioRecorder) {
+    /// Starts live partials from the selected engine. If it is unavailable, dictation still works on release.
+    private func startEngineStreamIfAvailable(prefs: VoicePreferences, recorder: VoiceAudioRecorder) {
         guard prefs.providerMode == .local,
-              prefs.localASRPreset == .whisperTurbo || prefs.localASRPreset == .whisperBase,
-              let serverBinary = VoiceWhisperServerManager.detectServerBinary() else { return }
-        let status = VoiceLocalInstaller.asrStatus(for: prefs.localASRPreset)
-        guard status.isReady, let modelPath = status.modelPath else { return }
-
-        let manager = VoiceWhisperServerManager.shared
-        manager.configure(binaryPath: serverBinary, modelPath: modelPath, language: prefs.language)
+              let manager = VoiceASRRegistry.engine(for: prefs, vocabulary: activeContext.personalVocabulary) else { return }
         let generation = sessionGeneration
         let stream = VoiceWhisperStreamSession(
             transcriber: manager,
@@ -414,12 +408,11 @@ public final class VoiceSessionController {
                 if useAppleSpeech {
                     rawTranscript = try await recorder.finishAppleSpeech()
                 } else {
-                    // Local Whisper invents text for silence, so it only ever receives detected speech.
-                    let isLocalWhisper = prefs.providerMode == .local
-                        && (prefs.localASRPreset == .whisperTurbo || prefs.localASRPreset == .whisperBase)
+                    // Local models invent text for silence, so they only ever receive detected speech.
+                    let usesLocalEngine = prefs.providerMode == .local && prefs.localASRPreset.backend == .engine
                     var audio = samples
                     var voicedSeconds = 0.0
-                    if isLocalWhisper {
+                    if usesLocalEngine {
                         let gated = await Task.detached(priority: .userInitiated) {
                             VoiceSpeechGate.finalAudio(samples)
                         }.value
@@ -439,7 +432,7 @@ public final class VoiceSessionController {
                             throw CancellationError()
                         } catch {
                             try Task.checkCancellation()
-                            VoiceWhisperServerManager.sharedIfLoaded?.stop()
+                            VoiceASRRegistry.stopAll()
                         }
                     }
                     if let residentText {
@@ -452,14 +445,14 @@ public final class VoiceSessionController {
                             wavData: wavData,
                             vocabulary: context.personalVocabulary
                         )
-                        rawTranscript = isLocalWhisper
+                        rawTranscript = usesLocalEngine
                             ? VoiceHallucinationFilter.filtered(
                                 VoiceWhisperStreamPolicy.simplified(cliText, language: prefs.language),
                                 voicedSeconds: voicedSeconds
                             )
                             : cliText
                     }
-                    if isLocalWhisper,
+                    if usesLocalEngine,
                        rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         throw VoiceEngineError.noSpeechDetected
                     }
@@ -526,20 +519,11 @@ public final class VoiceSessionController {
                 wavData: wavData
             )
         case .local:
-            switch prefs.localASRPreset {
+            switch prefs.localASRPreset.backend {
             case .appleSpeech:
                 return ""
-            case .whisperTurbo, .whisperBase:
-                let status = VoiceLocalInstaller.asrStatus(for: prefs.localASRPreset)
-                guard let bin = status.dependencyPath, let modelPath = status.modelPath, status.isReady else {
-                    throw VoiceEngineError.cliFailed("尚未安装本地语音模型，请在「句序偏好设置 → 语音输入」中点击一键下载并安装")
-                }
-                return try await client.transcribeLocalCLI(
-                    binaryPath: bin,
-                    modelPath: modelPath,
-                    language: prefs.language,
-                    wavData: wavData
-                )
+            case .engine:
+                return try await VoiceASRRegistry.transcribeWithFallback(prefs: prefs, client: client, wavData: wavData)
             case .customHTTP:
                 return try await client.transcribeOpenAICompatible(
                     baseURL: prefs.localHTTPASRBaseURL,

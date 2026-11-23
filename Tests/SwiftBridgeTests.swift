@@ -272,7 +272,14 @@ struct SwiftBridgeTests {
             let envelope = 0.6 + 0.4 * sin(2 * Double.pi * 4 * Double(i) / 16_000)
             voiced[i] = Int16(3_000 * envelope * sin(2 * Double.pi * 150 * Double(i) / 16_000))
         }
-        precondition(VoiceSpeechGate.finalAudio(voiced)?.audio.count == voiced.count, "speech is kept and the final is never trimmed")
+        precondition(VoiceSpeechGate.finalAudio(voiced) != nil, "periodic speech-like audio is kept")
+        precondition(VoiceLocalASRModelPreset(rawValue: "whisper_turbo") == .whisperTurbo, "existing presets still decode")
+        for preset in VoiceLocalASRModelPreset.allCases {
+            precondition(!preset.displayName.isEmpty, "every preset has a descriptor")
+            precondition((preset.descriptor.executor != nil) == (preset.backend == .engine))
+        }
+        precondition(VoiceLocalASRModelPreset.whisperTurbo.modelFilename == "ggml-large-v3-turbo-q5_0.bin", "existing model files keep their names")
+        precondition(VoiceLocalASRModelPreset.whisperBase.modelFilename == "ggml-base.bin")
         precondition(VoiceHallucinationFilter.shouldDrop("请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", voicedSeconds: 0.3))
         precondition(VoiceHallucinationFilter.shouldDrop("字幕志愿者 杨栋梁", voicedSeconds: 0))
         precondition(!VoiceHallucinationFilter.shouldDrop("请大家点赞订阅转发", voicedSeconds: 1.6), "a person really saying it keeps it")

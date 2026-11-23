@@ -100,38 +100,10 @@ public enum VoiceLocalASRModelPreset: String, Codable, CaseIterable, Identifiabl
 
     public var id: String { rawValue }
 
-    public var displayName: String {
-        switch self {
-        case .whisperTurbo: return "Whisper v3 Turbo（推荐）"
-        case .whisperBase: return "Whisper Base（轻量极速）"
-        case .appleSpeech: return "Apple 端侧语音（免下载）"
-        case .customHTTP: return "已有本地 HTTP 服务"
-        }
-    }
-
-    public var modelFilename: String? {
-        switch self {
-        case .whisperTurbo: return "ggml-large-v3-turbo-q5_0.bin"
-        case .whisperBase: return "ggml-base.bin"
-        case .appleSpeech, .customHTTP: return nil
-        }
-    }
-
-    public var approximateSizeLabel: String {
-        switch self {
-        case .whisperTurbo: return "547 MB"
-        case .whisperBase: return "142 MB"
-        case .appleSpeech, .customHTTP: return "0 MB"
-        }
-    }
-
-    public var downloadURLs: [URL] {
-        guard let filename = modelFilename else { return [] }
-        return [
-            URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(filename)")!,
-            URL(string: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/\(filename)")!,
-        ]
-    }
+    public var displayName: String { descriptor.displayName }
+    public var modelFilename: String? { descriptor.modelFilename }
+    public var approximateSizeLabel: String { descriptor.sizeLabel }
+    public var downloadURLs: [URL] { descriptor.downloadURLs }
 }
 
 public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Sendable {
