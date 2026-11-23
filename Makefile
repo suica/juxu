@@ -16,7 +16,7 @@ CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs) $(wildcard Core/src/bin
 VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceSessionTimeline.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
 UI_SOURCES = Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
 APP_SOURCES = $(UI_SOURCES) Sources/InputController.swift Sources/main.swift
-FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security
+FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security -framework Accelerate
 
 all: build/Juxu
 
