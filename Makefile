@@ -13,7 +13,7 @@ CORE_HEADER = Core/include/juxu_core.h
 CORE_FLAGS = -import-objc-header $(CORE_HEADER) $(CORE_LIB)
 CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs) $(wildcard Core/src/bin/*.rs)
 
-VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoiceASREngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
+VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
 UI_SOURCES = Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
 APP_SOURCES = $(UI_SOURCES) Sources/InputController.swift Sources/main.swift
 FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security
@@ -46,12 +46,19 @@ build/AppIcon.icns build/menu_icon.pdf: Scripts/DrawAssets.swift
 	done
 	iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns
 
-app: build/Juxu Resources/Info.plist build/AppIcon.icns build/menu_icon.pdf
+QWEN_HELPER = build/qwen/release/juxu-qwen-asr
+QWEN_SOURCES = Helpers/JuxuQwenASR/Package.swift $(wildcard Helpers/JuxuQwenASR/Sources/juxu-qwen-asr/*.swift) $(wildcard Helpers/JuxuQwenASR/Sources/juxu-qwen-asr/Vendor/*.swift)
+
+$(QWEN_HELPER): $(QWEN_SOURCES) Scripts/build-qwen-helper.sh
+	sh Scripts/build-qwen-helper.sh
+
+app: build/Juxu Resources/Info.plist build/AppIcon.icns build/menu_icon.pdf $(QWEN_HELPER)
 	rm -rf build/Juxu.app
 	mkdir -p build/Juxu.app/Contents/MacOS \
 	         build/Juxu.app/Contents/Resources/Dicts \
 	         build/Juxu.app/Contents/Resources/zh-Hans.lproj
 	cp build/Juxu build/Juxu.app/Contents/MacOS/Juxu
+	cp $(QWEN_HELPER) build/qwen/release/mlx.metallib build/Juxu.app/Contents/MacOS/
 	cp Resources/Info.plist build/Juxu.app/Contents/Info.plist
 	cp Resources/zh-Hans.lproj/InfoPlist.strings build/Juxu.app/Contents/Resources/zh-Hans.lproj/InfoPlist.strings
 	cp build/AppIcon.icns build/Juxu.app/Contents/Resources/AppIcon.icns
@@ -102,7 +109,7 @@ rust-test:
 
 swift-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoiceASREngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
+	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
 	build/swift-bridge-tests
 
 test: rust-test swift-test ios-test

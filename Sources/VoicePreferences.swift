@@ -93,6 +93,7 @@ public enum VoiceCloudPreset: String, Codable, CaseIterable, Identifiable, Senda
 }
 
 public enum VoiceLocalASRModelPreset: String, Codable, CaseIterable, Identifiable, Sendable {
+    case qwen3ASR = "qwen3_asr"
     case whisperTurbo = "whisper_turbo"
     case whisperBase = "whisper_base"
     case appleSpeech = "apple_speech"
