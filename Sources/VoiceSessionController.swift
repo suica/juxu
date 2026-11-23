@@ -423,6 +423,14 @@ public final class VoiceSessionController {
                     self?.timeline.mark(.firstBuffer, at: time)
                 }
             }
+            recorder.onAudioSpectrum = { [weak self] frames in
+                let time = CFAbsoluteTimeGetCurrent()
+                Task { @MainActor [weak self] in
+                    guard let self, self.phase == .recording || self.isStarting else { return }
+                    VoiceHUDPanelController.shared.enqueueSpectrumFrames(frames)
+                    self.timeline.mark(.firstBuffer, at: time)
+                }
+            }
             recorder.onPartialTranscript = { [weak self] partial in
                 Task { @MainActor [weak self] in
                     self?.latestPartial = partial

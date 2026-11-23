@@ -302,10 +302,12 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     private var appleFinalContinuation: CheckedContinuation<String, Error>?
     private var appleFinished = false
     private var levelMeter = VoiceLevelMeter()
+    private let spectrumAnalyzer = VoiceSpectrumAnalyzer()
     /// Buffers per whole dBFS, for the timing log. Holds no audio.
     private var levelHistogram = [Int](repeating: 0, count: 91)
 
     public var onAudioLevel: (@Sendable (Float) -> Void)?
+    public var onAudioSpectrum: (@Sendable ([[Float]]) -> Void)?
     public var onPartialTranscript: (@Sendable (String) -> Void)?
 
     public init() {}
@@ -442,6 +444,12 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                 levelHistogram[max(0, min(90, bucket))] += 1
                 lock.unlock()
                 onAudioLevel?(peakLevel)
+                if let onAudioSpectrum {
+                    let frames = spectrumAnalyzer.process(samples: channelData, count: count, sampleRate: sampleRate)
+                    if !frames.isEmpty {
+                        onAudioSpectrum(frames)
+                    }
+                }
             }
         }
 

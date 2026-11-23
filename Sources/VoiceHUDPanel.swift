@@ -1,3 +1,4 @@
+import Accelerate
 import AppKit
 import QuartzCore
 
@@ -95,6 +96,11 @@ final class VoiceHUDContentView: NSView {
     private var mode: Mode = .listening
     private var targetLevel: CGFloat = 0
     private var smoothedLevel: CGFloat = 0
+    private var targetBands: [CGFloat]
+    private var spectrumQueue: [[Float]] = []
+    private var spectrumStepElapsed: CFTimeInterval = 0
+    private var spectrumStaleElapsed: CFTimeInterval = 0
+    private var hasSpectrumInput = false
     private var barsAlpha: CGFloat = 1
     private var clock: CFTimeInterval = 0
     private var lastTimestamp: CFTimeInterval?
@@ -123,6 +129,7 @@ final class VoiceHUDContentView: NSView {
             1 - pow(abs(CGFloat(i) - centre) / (centre + 1), 1.5)
         }
         barHeights = Array(repeating: VoiceHUDMetrics.barWidth, count: count)
+        targetBands = Array(repeating: 0, count: count)
         super.init(frame: frameRect)
 
         let root = CALayer()
@@ -260,8 +267,41 @@ final class VoiceHUDContentView: NSView {
         }
     }
 
+    func enqueueSpectrumFrames(_ frames: [[Float]]) {
+        guard !frames.isEmpty else { return }
+        hasSpectrumInput = true
+        spectrumStaleElapsed = 0
+        if spectrumQueue.isEmpty {
+            // Apply the first frame immediately so onset feels instantaneous.
+            applyBandTargets(frames[0])
+            if frames.count > 1 {
+                spectrumQueue.append(contentsOf: frames.dropFirst())
+            }
+            spectrumStepElapsed = 0
+        } else {
+            spectrumQueue.append(contentsOf: frames)
+            if spectrumQueue.count > 8 {
+                spectrumQueue.removeFirst(spectrumQueue.count - 8)
+            }
+        }
+    }
+
+    private func applyBandTargets(_ frame: [Float]) {
+        for i in 0..<min(targetBands.count, frame.count) {
+            targetBands[i] = CGFloat(max(0, min(1, frame[i])))
+        }
+    }
+
     func resetForPresentation() {
         smoothedLevel = 0
+        targetLevel = 0
+        spectrumQueue.removeAll()
+        spectrumStepElapsed = 0
+        spectrumStaleElapsed = 0
+        hasSpectrumInput = false
+        for i in 0..<targetBands.count {
+            targetBands[i] = 0
+        }
         barsAlpha = 1
         lastTimestamp = nil
         currentPartial = ""
@@ -445,27 +485,61 @@ final class VoiceHUDContentView: NSView {
     /// Advances the waveform and spinner. Public to the module so previews are deterministic.
     func advance(dt: CFTimeInterval) {
         clock += dt
-        let levelTau: CGFloat = targetLevel > smoothedLevel ? 0.03 : 0.13
-        smoothedLevel += (targetLevel - smoothedLevel) * (1 - exp(-CGFloat(dt) / levelTau))
-
-        // The level is already perceptual (see VoiceLevelMeter), so it maps straight to height.
-        // Below the gate the bars collapse to a straight line of dots.
-        let energy = max(0, (smoothedLevel - 0.02) / 0.98)
         let dot = VoiceHUDMetrics.barWidth
         let span = VoiceHUDMetrics.barMaxHeight - dot
+
+        if mode != .listening {
+            spectrumQueue.removeAll()
+            spectrumStepElapsed = 0
+            for i in 0..<targetBands.count { targetBands[i] = 0 }
+        } else if hasSpectrumInput {
+            spectrumStepElapsed += dt
+            var popped = false
+            while spectrumStepElapsed >= VoiceSpectrumAnalyzer.frameDuration, !spectrumQueue.isEmpty {
+                applyBandTargets(spectrumQueue.removeFirst())
+                spectrumStepElapsed -= VoiceSpectrumAnalyzer.frameDuration
+                popped = true
+            }
+            if popped {
+                spectrumStaleElapsed = 0
+            } else if spectrumQueue.isEmpty {
+                spectrumStepElapsed = min(spectrumStepElapsed, VoiceSpectrumAnalyzer.frameDuration)
+                spectrumStaleElapsed += dt
+                if spectrumStaleElapsed > 0.16 {
+                    let decay = exp(-CGFloat(dt) / 0.08)
+                    for i in 0..<targetBands.count {
+                        targetBands[i] *= decay
+                    }
+                }
+            }
+        } else {
+            let levelTau: CGFloat = targetLevel > smoothedLevel ? 0.03 : 0.13
+            smoothedLevel += (targetLevel - smoothedLevel) * (1 - exp(-CGFloat(dt) / levelTau))
+        }
+
+        let energy = max(0, (smoothedLevel - 0.02) / 0.98)
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for i in 0..<barLayers.count {
             var target = dot
-            if mode == .listening, energy > 0 {
-                let phase = Double(i) * 2.399
-                let wobble = reduceMotion
-                    ? 1.0
-                    : 0.74 + 0.26 * (0.5 + 0.5 * sin(clock * 11.0 + phase) * cos(clock * 6.7 + phase * 1.7))
-                target = dot + span * energy * barEnvelope[i] * CGFloat(wobble)
+            if mode == .listening {
+                if hasSpectrumInput {
+                    let band = targetBands[i]
+                    if band > 0.015 {
+                        target = dot + span * band
+                    }
+                } else if energy > 0 {
+                    let phase = Double(i) * 2.399
+                    let wobble = reduceMotion
+                        ? 1.0
+                        : 0.74 + 0.26 * (0.5 + 0.5 * sin(clock * 11.0 + phase) * cos(clock * 6.7 + phase * 1.7))
+                    target = dot + span * energy * barEnvelope[i] * CGFloat(wobble)
+                }
             }
-            let tau: CGFloat = target > barHeights[i] ? 0.028 : 0.1
+            let attackTau: CGFloat = reduceMotion ? 0.06 : (hasSpectrumInput ? 0.020 : 0.028)
+            let releaseTau: CGFloat = reduceMotion ? 0.14 : (hasSpectrumInput ? 0.068 : 0.10)
+            let tau: CGFloat = target > barHeights[i] ? attackTau : releaseTau
             barHeights[i] += (target - barHeights[i]) * (1 - exp(-CGFloat(dt) / tau))
             barLayers[i].bounds.size.height = max(dot, barHeights[i])
         }
@@ -535,6 +609,190 @@ struct VoiceLevelMeter {
     }
 }
 
+/// Real-time 11-band speech spectrum analyzer (Accelerate vDSP FFT) driving the 11 HUD bars
+/// independently from actual voice formants and consonants.
+/// Display only: never touches the audio sent to the recogniser or speech gate.
+final class VoiceSpectrumAnalyzer {
+    static let barCount = VoiceHUDMetrics.barCount
+    static let frameDuration: CFTimeInterval = 0.025
+
+    // 11 log-spaced speech bands from 130 Hz (fundamental) to 4800 Hz (sibilants).
+    static let bandEdgesHz: [Float] = [
+        130, 210, 310, 450, 650, 920, 1300, 1800, 2400, 3100, 3900, 4800,
+    ]
+    // Place strongest vowel formants near center and crisp harmonics/consonants toward the flanks,
+    // keeping all 11 bars mapped to distinct frequency bands (no mirror duplication).
+    static let barToBand: [Int] = [9, 7, 0, 5, 2, 3, 4, 1, 6, 8, 10]
+    static let barTaper: [Float] = [0.66, 0.78, 0.88, 0.94, 0.98, 1.00, 0.98, 0.94, 0.88, 0.78, 0.66]
+
+    private var cachedSampleRate: Double = 0
+    private var nfft: Int = 0
+    private var log2n: vDSP_Length = 0
+    private var fftSetup: FFTSetup?
+    private var window: [Float] = []
+    private var windowNorm: Float = 1
+    private var binRanges: [Range<Int>] = []
+    private var tiltDB: [Float] = []
+    private var floorMarginsDB: [Float] = []
+
+    private var bandFloorsDB: [Float?] = Array(repeating: nil, count: barCount)
+    private var peakAboveDB: Float = 14
+
+    // Scratch buffers reused on the audio thread.
+    private var frameBuf: [Float] = []
+    private var realPart: [Float] = []
+    private var imagPart: [Float] = []
+    private var magSq: [Float] = []
+
+    init() {
+        tiltDB = (0..<Self.barCount).map { b in
+            let fc = sqrt(Self.bandEdgesHz[b] * Self.bandEdgesHz[b + 1])
+            return 2.8 * log2(max(fc, 200) / 300)
+        }
+        floorMarginsDB = (0..<Self.barCount).map { b in
+            // Slightly tighter margin on upper bands so quiet fricatives pop cleanly while
+            // low-frequency laptop fan noise stays completely at rest.
+            4.8 - 0.8 * (Float(b) / Float(Self.barCount - 1))
+        }
+    }
+
+    deinit {
+        if let setup = fftSetup {
+            vDSP_destroy_fftsetup(setup)
+        }
+    }
+
+    private func ensureConfigured(sampleRate: Double) {
+        guard sampleRate > 0, sampleRate != cachedSampleRate else { return }
+        if let setup = fftSetup {
+            vDSP_destroy_fftsetup(setup)
+            fftSetup = nil
+        }
+        cachedSampleRate = sampleRate
+        nfft = sampleRate <= 24_000 ? 512 : 1024
+        log2n = vDSP_Length(round(log2(Double(nfft))))
+        fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
+
+        window = [Float](repeating: 0, count: nfft)
+        vDSP_hann_window(&window, vDSP_Length(nfft), Int32(vDSP_HANN_NORM))
+        var norm: Float = 0
+        vDSP_dotpr(window, 1, window, 1, &norm, vDSP_Length(nfft))
+        windowNorm = max(norm, 1e-6)
+
+        let half = nfft / 2
+        let binHz = Float(sampleRate) / Float(nfft)
+        binRanges = (0..<Self.barCount).map { b in
+            let lo = max(1, Int(floor(Self.bandEdgesHz[b] / binHz)))
+            let hi = min(half, max(lo + 1, Int(ceil(Self.bandEdgesHz[b + 1] / binHz))))
+            return lo..<hi
+        }
+
+        frameBuf = [Float](repeating: 0, count: nfft)
+        realPart = [Float](repeating: 0, count: half)
+        imagPart = [Float](repeating: 0, count: half)
+        magSq = [Float](repeating: 0, count: half)
+    }
+
+    /// Slices a CoreAudio PCM buffer into ~25 ms sub-windows and returns one 11-bar frame per slice.
+    func process(samples: UnsafePointer<Float>, count: Int, sampleRate: Double) -> [[Float]] {
+        guard count > 0, sampleRate > 0 else { return [] }
+        ensureConfigured(sampleRate: sampleRate)
+        let step = max(1, Int((sampleRate * Self.frameDuration).rounded()))
+        var frames: [[Float]] = []
+        frames.reserveCapacity(max(1, (count + step - 1) / step))
+        var offset = 0
+        while offset < count {
+            let end = min(count, offset + step)
+            let chunk = end - offset
+            if chunk >= step / 2 || frames.isEmpty {
+                // Use up to `nfft` samples ending at `end` so short 25 ms slices still get full FFT resolution.
+                let sliceStart = max(0, end - nfft)
+                let sliceCount = end - sliceStart
+                let sec = Float(Double(chunk) / sampleRate)
+                frames.append(analyzeSlice(samples + sliceStart, count: sliceCount, seconds: sec))
+            }
+            offset = end
+        }
+        return frames
+    }
+
+    /// Convenience helper for array inputs and deterministic unit tests.
+    func processFrame(_ samples: [Float], sampleRate: Double, seconds: Float? = nil) -> [Float] {
+        guard !samples.isEmpty, sampleRate > 0 else { return Array(repeating: 0, count: Self.barCount) }
+        ensureConfigured(sampleRate: sampleRate)
+        let sliceCount = min(samples.count, nfft)
+        let sec = seconds ?? Float(Double(samples.count) / sampleRate)
+        return samples.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return Array(repeating: 0, count: Self.barCount) }
+            return analyzeSlice(base + (samples.count - sliceCount), count: sliceCount, seconds: sec)
+        }
+    }
+
+    private func analyzeSlice(_ ptr: UnsafePointer<Float>, count: Int, seconds: Float) -> [Float] {
+        guard let setup = fftSetup, nfft > 0 else { return Array(repeating: 0, count: Self.barCount) }
+        let copyCount = min(count, nfft)
+        let pad = nfft - copyCount
+        if pad > 0 {
+            for i in 0..<pad { frameBuf[i] = 0 }
+        }
+        for i in 0..<copyCount {
+            frameBuf[pad + i] = ptr[i]
+        }
+        vDSP_vmul(frameBuf, 1, window, 1, &frameBuf, 1, vDSP_Length(nfft))
+
+        let half = nfft / 2
+        realPart.withUnsafeMutableBufferPointer { rBuf in
+            imagPart.withUnsafeMutableBufferPointer { iBuf in
+                var split = DSPSplitComplex(realp: rBuf.baseAddress!, imagp: iBuf.baseAddress!)
+                frameBuf.withUnsafeBytes { rawBytes in
+                    let complexPtr = rawBytes.bindMemory(to: DSPComplex.self)
+                    vDSP_ctoz(complexPtr.baseAddress!, 2, &split, 1, vDSP_Length(half))
+                }
+                vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(kFFTDirection_Forward))
+                vDSP_zvmags(&split, 1, &magSq, 1, vDSP_Length(half))
+            }
+        }
+
+        // `vDSP_fft_zrip` scales the forward DFT by 2 (squared = 4); multiplying by 2 for +/- frequencies
+        // yields `magSq / (2 * N * sum(w^2))` as RMS-equivalent band power.
+        let powerScale = 1.0 / (2.0 * Float(nfft) * windowNorm)
+        var rawAbove = [Float](repeating: 0, count: Self.barCount)
+        var frameMax: Float = -100
+
+        for b in 0..<Self.barCount {
+            var bandPower: Float = 0
+            for bin in binRanges[b] {
+                bandPower += magSq[bin]
+            }
+            bandPower *= powerScale
+            let db = 10 * log10(max(bandPower, 1e-12)) + tiltDB[b]
+            let clamped = min(-38, max(-85, db))
+            if let floor = bandFloorsDB[b] {
+                let tau: Float = clamped < floor ? 0.20 : 6.0
+                bandFloorsDB[b] = floor + (clamped - floor) * (1 - exp(-seconds / tau))
+            } else {
+                bandFloorsDB[b] = clamped
+            }
+            let floor = bandFloorsDB[b] ?? clamped
+            let above = db - (floor + floorMarginsDB[b])
+            rawAbove[b] = above
+            if above > frameMax { frameMax = above }
+        }
+
+        let targetPeak = min(Float(36), max(Float(13), frameMax))
+        let peakTau: Float = targetPeak > peakAboveDB ? 0.25 : 4.0
+        peakAboveDB += (targetPeak - peakAboveDB) * (1 - exp(-seconds / peakTau))
+        let span = max(Float(13), peakAboveDB)
+
+        var bars = [Float](repeating: 0, count: Self.barCount)
+        for i in 0..<Self.barCount {
+            let norm = max(0, min(1, rawAbove[Self.barToBand[i]] / span))
+            bars[i] = pow(norm, 1.15) * Self.barTaper[i]
+        }
+        return bars
+    }
+}
+
 /// Strictly on-demand floating HUD panel for macOS voice dictation.
 /// Never allocated until voice input is enabled and triggered; released on `unload()`.
 @MainActor
@@ -587,6 +845,10 @@ public final class VoiceHUDPanelController {
 
         self.contentView = content
         self.panel = p
+    }
+
+    public func enqueueSpectrumFrames(_ frames: [[Float]]) {
+        contentView.enqueueSpectrumFrames(frames)
     }
 
     public func show(

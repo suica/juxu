@@ -435,6 +435,31 @@ struct SwiftBridgeTests {
         let closeWhisper = closeMicMeter.process(rms: rmsFromDB(-42), seconds: 0.1)
         precondition(closeWhisper > 0.05 && closeWhisper < closeNormal && closeNormal < closeLoud, "adaptive ceiling separates whisper, normal and loud speech on hot mics")
 
+        // The 11-band speech spectrum analyzer separates frequency bands independently across bars
+        // while keeping steady room noise at zero.
+        let sampleRate = 16_000.0
+        let frameLen = 512
+        let makeTone = { (hz: Double, amp: Float) -> [Float] in
+            (0..<frameLen).map { i in amp * sin(Float(2 * Double.pi * hz * Double(i) / sampleRate)) }
+        }
+        let quietFloor = (0..<frameLen).map { i in
+            Float(0.008) * sin(Float(Double(i) * 0.13)) // ~-45 dBFS steady rumble
+        }
+        let spectrum = VoiceSpectrumAnalyzer()
+        for _ in 0..<12 { _ = spectrum.processFrame(quietFloor, sampleRate: sampleRate) }
+        let quietBars = spectrum.processFrame(quietFloor, sampleRate: sampleRate)
+        precondition(quietBars.allSatisfy { $0 < 0.05 }, "steady room noise stays at rest across all 11 bars, got \(quietBars)")
+
+        let lowVowel = makeTone(520, 0.05) // Band 3 -> center bar 5
+        let lowBars = spectrum.processFrame(lowVowel, sampleRate: sampleRate)
+        precondition(lowBars[5] > 0.5 && lowBars[5] > lowBars[0] * 3 && lowBars[5] > lowBars[10] * 3,
+                     "520 Hz vowel peaks on center bar 5, got \(lowBars)")
+
+        let highSibilant = makeTone(3450, 0.04) // Band 9 -> outer bar 0
+        let highBars = spectrum.processFrame(highSibilant, sampleRate: sampleRate)
+        precondition(highBars[0] > 0.4 && highBars[0] > highBars[5] * 2,
+                     "3450 Hz fricative peaks on high-frequency bar 0 rather than center bar 5, got \(highBars)")
+
         // Hold logic, fed the same synthetic events a listener would deliver. The microphone is never started.
         VoicePreferencesStore.shared.update({ $0.enabled = true; $0.triggerKey = .rightCommand }, persist: false)
         let holdSession = VoiceSessionController.shared
