@@ -3,7 +3,7 @@ import QuartzCore
 
 public enum VoiceHUDState: Equatable {
     case hidden
-    case recording(level: Float, elapsed: TimeInterval, partial: String, modeLabel: String)
+    case recording(level: Float, elapsed: TimeInterval, partial: String, modeLabel: String, tentativeCount: Int = 0)
     case transcribing(modeLabel: String)
     case polishing(preview: String)
     case notice(text: String, isError: Bool)
@@ -97,6 +97,7 @@ final class VoiceHUDContentView: NSView {
     private var lastTimestamp: CFTimeInterval?
     private var displayLinkHandle: CADisplayLink?
     private var currentPartial = ""
+    private var currentTentativeCount = 0
     private var cardWidthFloor: CGFloat = 0
     private var cardLinesFloor = 1
     private var currentNotice = ""
@@ -212,15 +213,17 @@ final class VoiceHUDContentView: NSView {
     func apply(_ state: VoiceHUDState, animated: Bool) {
         let newMode: Mode
         var partial = ""
+        var tentativeCount = 0
         var notice = ""
         var noticeIsError = false
         switch state {
         case .hidden:
             return
-        case .recording(let level, _, let text, _):
+        case .recording(let level, _, let text, _, let tentative):
             newMode = .listening
             targetLevel = CGFloat(max(0, min(1, level)))
             partial = text
+            tentativeCount = tentative
         case .transcribing, .polishing:
             newMode = .processing
             targetLevel = 0
@@ -239,8 +242,9 @@ final class VoiceHUDContentView: NSView {
         if modeChanged || noticeChanged {
             layoutPill(animated: animated && !reduceMotion)
         }
-        if partial != currentPartial {
+        if partial != currentPartial || tentativeCount != currentTentativeCount {
             currentPartial = partial
+            currentTentativeCount = tentativeCount
             if partial.isEmpty {
                 cardWidthFloor = 0
                 cardLinesFloor = 1
@@ -361,7 +365,17 @@ final class VoiceHUDContentView: NSView {
             width: cardWidthFloor,
             height: textHeight
         )
-        cardTextLayer.string = NSAttributedString(string: fitted, attributes: attrs)
+        let caption = NSMutableAttributedString(string: fitted, attributes: attrs)
+        let dimmed = min(currentTentativeCount, fitted.count)
+        if dimmed > 0 {
+            let start = fitted.index(fitted.endIndex, offsetBy: -dimmed)
+            caption.addAttribute(
+                .foregroundColor,
+                value: NSColor.white.withAlphaComponent(0.55),
+                range: NSRange(start..., in: fitted)
+            )
+        }
+        cardTextLayer.string = caption
         cardLayer.opacity = 1
     }
 
