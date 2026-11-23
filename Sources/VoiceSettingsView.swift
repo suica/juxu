@@ -459,7 +459,7 @@ private struct LocalVoiceConfigCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("本地语音识别模型")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("自动安装 whisper.cpp（Metal 加速）并下载模型，按需运行不常驻")
+                    Text("选择模型并一键下载；按需运行，闲置自动释放")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }
@@ -473,12 +473,12 @@ private struct LocalVoiceConfigCard: View {
                 .frame(width: 245)
             }
 
-            switch asrPreset {
-            case .whisperTurbo, .whisperBase:
+            switch asrPreset.backend {
+            case .engine:
                 installActionRow(
                     status: asrStatus,
                     sizeLabel: asrPreset.approximateSizeLabel,
-                    depName: "whisper.cpp",
+                    depName: asrPreset.descriptor.engineLabel,
                     onInstall: { installer.installASR(preset: asrPreset) },
                     onDelete: {
                         if let file = asrPreset.modelFilename {

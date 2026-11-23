@@ -47,6 +47,21 @@ public enum VoiceWhisperStreamPolicy {
         return out
     }
 
+    /// Simplified output with hallucinated credit lines removed and segment breaks joined.
+    public static func cleanedTranscript(_ text: String, language: String, voicedSeconds: Double) -> String {
+        // Simplify first so a Traditional credit line is still recognised by the filter.
+        let simple = simplified(text, language: language)
+        return normalizedTranscript(VoiceHallucinationFilter.filtered(simple, voicedSeconds: voicedSeconds))
+    }
+
+    /// Reads back the canonical 44-byte-header PCM written by `VoiceWAVEncoder`.
+    static func pcmSamples(fromWAV wav: Data) -> [Int16] {
+        guard wav.count > 44 else { return [] }
+        return wav.dropFirst(44).withUnsafeBytes { raw in
+            Array(raw.bindMemory(to: Int16.self))
+        }
+    }
+
     /// Whisper separates segments with newlines; dictation should not insert line breaks.
     public static func normalizedTranscript(_ raw: String) -> String {
         let lines = raw.split(whereSeparator: \.isNewline)
@@ -67,8 +82,8 @@ public enum VoiceWhisperStreamPolicy {
 
 // MARK: - Speech Gate
 
-/// Decides from the audio alone whether anyone spoke. Whisper cannot be asked: it transcribes
-/// silence confidently, and its `no_speech_prob` stays near 1e-10 even then.
+/// Decides from the audio alone whether anyone spoke. Whisper and Qwen cannot be asked: both
+/// transcribe silence confidently, and Whisper's `no_speech_prob` stays near 1e-10 even then.
 ///
 /// A frame counts as voiced when it is periodic in the human pitch range, which does not depend on
 /// microphone level, and stands above the clip's own noise floor. Thresholds were chosen on half of
@@ -254,16 +269,6 @@ public enum VoiceHallucinationFilter {
     }
 }
 
-// MARK: - Transcriber Abstraction
-
-@MainActor
-public protocol VoiceWhisperTranscribing: AnyObject {
-    func beginSession()
-    func endSession()
-    func prepare() async throws
-    func transcribe(wavData: Data, language: String, timeout: TimeInterval) async throws -> String
-}
-
 // MARK: - Resident whisper-server Manager
 
 /// Owns the on-demand `whisper-server` child. Never allocated until a local Whisper recording starts.
@@ -272,7 +277,7 @@ public protocol VoiceWhisperTranscribing: AnyObject {
 /// write end only Juxu has. When Juxu exits for any reason, including SIGKILL, the pipe reaches
 /// EOF and the supervisor terminates the server, so it cannot be orphaned.
 @MainActor
-public final class VoiceWhisperServerManager: VoiceWhisperTranscribing {
+public final class VoiceWhisperServerManager: VoiceASREngine {
     private static var _shared: VoiceWhisperServerManager?
 
     public static var isLoaded: Bool { _shared != nil }
@@ -375,6 +380,8 @@ public final class VoiceWhisperServerManager: VoiceWhisperTranscribing {
         _ = try await ensureRunning()
     }
 
+    public func release() { stop() }
+
     public func stop() {
         idleItem?.cancel()
         idleItem = nil
@@ -383,7 +390,7 @@ public final class VoiceWhisperServerManager: VoiceWhisperTranscribing {
         terminateChild()
     }
 
-    public func transcribe(wavData: Data, language: String, timeout: TimeInterval) async throws -> String {
+    public func transcribe(wavData: Data, language: String, timeout: TimeInterval, isFinal: Bool) async throws -> String {
         let port = try await ensureRunning()
         try Task.checkCancellation()
         guard let url = URL(string: "http://127.0.0.1:\(port)/inference") else {
@@ -418,20 +425,11 @@ public final class VoiceWhisperServerManager: VoiceWhisperTranscribing {
             throw VoiceEngineError.cliFailed("本地常驻识别返回异常")
         }
         // Plain `json` on purpose: `verbose_json` measured 0.78 s against 0.42 s per pass on this model.
-        let voiced = VoiceSpeechGate.voicedSeconds(Self.pcmSamples(fromWAV: wavData))
-        // Simplify first so a Traditional credit line is still recognised by the filter.
-        let simplified = VoiceWhisperStreamPolicy.simplified(text, language: language)
-        return VoiceWhisperStreamPolicy.normalizedTranscript(
-            VoiceHallucinationFilter.filtered(simplified, voicedSeconds: voiced)
+        return VoiceWhisperStreamPolicy.cleanedTranscript(
+            text,
+            language: language,
+            voicedSeconds: VoiceSpeechGate.voicedSeconds(VoiceWhisperStreamPolicy.pcmSamples(fromWAV: wavData))
         )
-    }
-
-    /// Reads back the canonical 44-byte-header PCM written by `VoiceWAVEncoder`.
-    private static func pcmSamples(fromWAV wav: Data) -> [Int16] {
-        guard wav.count > 44 else { return [] }
-        return wav.dropFirst(44).withUnsafeBytes { raw in
-            Array(raw.bindMemory(to: Int16.self))
-        }
     }
 
     // MARK: Private
@@ -613,7 +611,7 @@ public final class VoiceWhisperStreamSession {
         case ended
     }
 
-    private let transcriber: VoiceWhisperTranscribing
+    private let transcriber: VoiceASREngine
     private let language: String
     private let sampleProvider: SampleProvider
     private let onPartial: @MainActor (String) -> Void
@@ -621,7 +619,7 @@ public final class VoiceWhisperStreamSession {
     private var loopTask: Task<Void, Never>?
 
     public init(
-        transcriber: VoiceWhisperTranscribing,
+        transcriber: VoiceASREngine,
         language: String,
         sampleProvider: @escaping SampleProvider,
         onPartial: @escaping @MainActor (String) -> Void
@@ -651,7 +649,8 @@ public final class VoiceWhisperStreamSession {
         let text = try await transcriber.transcribe(
             wavData: wavData,
             language: language,
-            timeout: VoiceWhisperStreamPolicy.finalRequestTimeout(sampleCount: sampleCount)
+            timeout: VoiceWhisperStreamPolicy.finalRequestTimeout(sampleCount: sampleCount),
+            isFinal: true
         )
         try Task.checkCancellation()
         guard state == .finishing else { throw CancellationError() }
@@ -696,7 +695,8 @@ public final class VoiceWhisperStreamSession {
                     let text = try await transcriber.transcribe(
                         wavData: wav,
                         language: language,
-                        timeout: VoiceWhisperStreamPolicy.partialRequestTimeout
+                        timeout: VoiceWhisperStreamPolicy.partialRequestTimeout,
+                        isFinal: false
                     )
                     guard !Task.isCancelled, state == .streaming else { return }
                     if !text.isEmpty {
