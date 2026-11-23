@@ -318,7 +318,7 @@ public final class VoiceGlobalHotkeyController {
         if allowed, tap == nil {
             startTap()
         } else if !allowed, tap != nil {
-            VoiceSessionController.sharedIfLoaded?.cancelForChord()
+            VoiceSessionController.sharedIfLoaded?.cancelForLostListener()
             stopTap()
         }
         if !hasLoggedState || wasListening != (tap != nil) {

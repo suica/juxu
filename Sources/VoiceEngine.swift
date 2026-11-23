@@ -2,6 +2,21 @@ import AVFoundation
 import Foundation
 import Speech
 
+/// Which samples of a captured buffer fall inside the time a cue is audible.
+enum VoiceCueMute {
+    static func sampleRange(
+        bufferStart: TimeInterval,
+        count: Int,
+        sampleRate: Double,
+        muteStart: TimeInterval,
+        muteEnd: TimeInterval
+    ) -> Range<Int> {
+        let first = max(0, min(count, Int(((muteStart - bufferStart) * sampleRate).rounded())))
+        let last = max(first, min(count, Int(((muteEnd - bufferStart) * sampleRate).rounded())))
+        return first..<last
+    }
+}
+
 public struct VoiceContext: Sendable {
     public let bundleIdentifier: String?
     public let appName: String?
@@ -352,6 +367,8 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     private let spectrumAnalyzer = VoiceSpectrumAnalyzer()
     /// Buffers per whole dBFS, for the timing log. Holds no audio.
     private var levelHistogram = [Int](repeating: 0, count: 91)
+    private var cueMuteStart: TimeInterval = 0
+    private var cueMuteEnd: TimeInterval = 0
 
     public var onAudioLevel: (@Sendable (Float) -> Void)?
     public var onAudioSpectrum: (@Sendable ([[Float]]) -> Void)?
@@ -447,10 +464,10 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
             }
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, when in
             guard let self else { return }
             self.speechRequest?.append(buffer)
-            self.processBuffer(buffer)
+            self.processBuffer(buffer, when: when)
         }
 
         eng.prepare()
@@ -458,7 +475,16 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
         self.engine = eng
     }
 
-    private func processBuffer(_ buffer: AVAudioPCMBuffer) {
+    /// Blanks what the microphone captures while a cue is audible, so it never reaches the recogniser.
+    func muteInput(forSeconds seconds: TimeInterval) {
+        let now = AVAudioTime.seconds(forHostTime: mach_absolute_time())
+        lock.lock()
+        cueMuteStart = now
+        cueMuteEnd = now + seconds
+        lock.unlock()
+    }
+
+    private func processBuffer(_ buffer: AVAudioPCMBuffer, when: AVAudioTime) {
         // HUD meter only: the audio sent to the recogniser is converted below, untouched by this.
         if let channelData = buffer.floatChannelData?[0] {
             let count = Int(buffer.frameLength)
@@ -524,7 +550,18 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
             let count = Int(outBuffer.frameLength)
             let chunk = UnsafeBufferPointer(start: int16Ptr, count: count)
             lock.lock()
+            let firstNew = pcm16Samples.count
             pcm16Samples.append(contentsOf: chunk)
+            if when.isHostTimeValid, cueMuteEnd > cueMuteStart {
+                let muted = VoiceCueMute.sampleRange(
+                    bufferStart: AVAudioTime.seconds(forHostTime: when.hostTime),
+                    count: count,
+                    sampleRate: targetFormat.sampleRate,
+                    muteStart: cueMuteStart,
+                    muteEnd: cueMuteEnd
+                )
+                for i in muted { pcm16Samples[firstNew + i] = 0 }
+            }
             lock.unlock()
         }
     }

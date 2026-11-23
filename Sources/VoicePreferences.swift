@@ -249,6 +249,10 @@ public struct VoicePreferences: Codable, Equatable, Sendable {
     public var globalVoiceHotkey: Bool?
     public var isGlobalHotkeyEnabled: Bool { globalVoiceHotkey ?? false }
 
+    /// Optional so existing voice.json files still decode; nil means the default, on.
+    public var voiceCues: Bool?
+    public var areVoiceCuesEnabled: Bool { voiceCues ?? true }
+
     public init() {}
 
     public var effectiveCloudASRBaseURL: String {
