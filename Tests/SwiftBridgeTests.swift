@@ -300,6 +300,17 @@ struct SwiftBridgeTests {
         precondition(VoiceWhisperStreamPolicy.simplified("三點", language: "en") == "三點", "only zh is converted")
         precondition(VoiceHallucinationFilter.shouldDrop(VoiceWhisperStreamPolicy.simplified("請不吝點贊 訂閱 轉發 打賞支持明鏡與點點欄目", language: "zh"), voicedSeconds: 0.3))
 
+        let cadence = VoicePartialCadence.standard
+        precondition(cadence.interval(lastPass: 0.1, thermal: .nominal, lowPower: false, memoryPressure: false) == cadence.minInterval, "fast passes run at the target cadence")
+        precondition(abs(cadence.interval(lastPass: 0.7, thermal: .nominal, lowPower: false, memoryPressure: false) - 1.0) < 0.001, "slow passes back off so the model is not pinned")
+        precondition(cadence.interval(lastPass: 0.1, thermal: .serious, lowPower: false, memoryPressure: false) >= 1.0, "a hot Mac slows captions")
+        precondition(cadence.interval(lastPass: 0.1, thermal: .critical, lowPower: false, memoryPressure: false) >= 2.0)
+        precondition(cadence.interval(lastPass: 0.1, thermal: .nominal, lowPower: true, memoryPressure: false) >= 0.7, "Low Power Mode slows captions")
+        precondition(cadence.interval(lastPass: 0.1, thermal: .nominal, lowPower: false, memoryPressure: true) >= 1.0, "memory pressure slows captions")
+        var timing = VoiceSessionTimeline()
+        timing.begin(); timing.mark(.release, at: CFAbsoluteTimeGetCurrent() + 1); timing.mark(.release, at: CFAbsoluteTimeGetCurrent() + 9)
+        precondition(timing.summary.contains("release=") && !timing.summary.contains("release=9"), "a timing mark keeps its first value")
+
         var stable = VoicePartialStabilizer()
         precondition(stable.update("今天下午", windowed: false) == VoicePartialDisplay(text: "今天下午", tentativeCount: 4), "the first pass is tentative")
         precondition(stable.update("今天下午三点", windowed: false) == VoicePartialDisplay(text: "今天下午三点", tentativeCount: 2), "text seen twice is locked")

@@ -13,7 +13,7 @@ CORE_HEADER = Core/include/juxu_core.h
 CORE_FLAGS = -import-objc-header $(CORE_HEADER) $(CORE_LIB)
 CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs) $(wildcard Core/src/bin/*.rs)
 
-VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
+VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceSessionTimeline.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
 UI_SOURCES = Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
 APP_SOURCES = $(UI_SOURCES) Sources/InputController.swift Sources/main.swift
 FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security
@@ -109,7 +109,7 @@ rust-test:
 
 swift-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
+	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceSessionTimeline.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
 	build/swift-bridge-tests
 
 test: rust-test swift-test ios-test

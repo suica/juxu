@@ -27,6 +27,9 @@ enum VoiceHUDMetrics {
     static let cardPadY: CGFloat = 9
     static let noticeMaxTextWidth: CGFloat = 360
     static let fadeDuration: CFTimeInterval = 0.14
+    /// New caption characters are placed at once and fade in over this time.
+    static let captionFadeDuration: CFTimeInterval = 0.11
+    static let captionMaxStagger: CFTimeInterval = 0.05
 }
 
 enum VoiceHUDTextFit {
@@ -98,6 +101,10 @@ final class VoiceHUDContentView: NSView {
     private var displayLinkHandle: CADisplayLink?
     private var currentPartial = ""
     private var currentTentativeCount = 0
+    private var captionSource = ""
+    private var captionFitted = ""
+    private var captionFadeCount = 0
+    private var captionFadeElapsed: CFTimeInterval = 0
     private var cardWidthFloor: CGFloat = 0
     private var cardLinesFloor = 1
     private var currentNotice = ""
@@ -258,6 +265,7 @@ final class VoiceHUDContentView: NSView {
         barsAlpha = 1
         lastTimestamp = nil
         currentPartial = ""
+        captionFadeCount = 0
         cardWidthFloor = 0
         cardLinesFloor = 1
         layoutCard()
@@ -325,6 +333,9 @@ final class VoiceHUDContentView: NSView {
         guard mode == .listening, !text.isEmpty else {
             cardLayer.opacity = 0
             cardTextLayer.string = nil
+            captionSource = ""
+            captionFitted = ""
+            captionFadeCount = 0
             return
         }
 
@@ -365,8 +376,22 @@ final class VoiceHUDContentView: NSView {
             width: cardWidthFloor,
             height: textHeight
         )
+        // Only characters that are actually new fade in; a rewrite fades from where it differs.
+        let unchanged = zip(captionSource, text).prefix { $0 == $1 }.count
+        captionFadeCount = reduceMotion ? 0 : min(max(0, text.count - unchanged), fitted.count)
+        captionFadeElapsed = 0
+        captionSource = text
+        captionFitted = fitted
+        renderCaption()
+        cardLayer.opacity = 1
+    }
+
+    private func renderCaption() {
+        let attrs = VoiceHUDTextFit.attributes(font: cardFont, lineHeight: VoiceHUDMetrics.cardLineHeight)
+        let fitted = captionFitted
         let caption = NSMutableAttributedString(string: fitted, attributes: attrs)
-        let dimmed = min(currentTentativeCount, fitted.count)
+        let total = fitted.count
+        let dimmed = min(currentTentativeCount, total)
         if dimmed > 0 {
             let start = fitted.index(fitted.endIndex, offsetBy: -dimmed)
             caption.addAttribute(
@@ -375,8 +400,22 @@ final class VoiceHUDContentView: NSView {
                 range: NSRange(start..., in: fitted)
             )
         }
+        if captionFadeCount > 0 {
+            let stagger = min(0.012, VoiceHUDMetrics.captionMaxStagger / Double(captionFadeCount))
+            var index = fitted.index(fitted.endIndex, offsetBy: -captionFadeCount)
+            for k in 0..<captionFadeCount {
+                let next = fitted.index(after: index)
+                let progress = max(0, min(1, (captionFadeElapsed - stagger * Double(k)) / VoiceHUDMetrics.captionFadeDuration))
+                let base: CGFloat = captionFadeCount - k <= dimmed ? 0.55 : 1
+                caption.addAttribute(
+                    .foregroundColor,
+                    value: NSColor.white.withAlphaComponent(base * CGFloat(progress)),
+                    range: NSRange(index..<next, in: fitted)
+                )
+                index = next
+            }
+        }
         cardTextLayer.string = caption
-        cardLayer.opacity = 1
     }
 
     // MARK: Animation
@@ -434,6 +473,13 @@ final class VoiceHUDContentView: NSView {
         let alphaTarget: CGFloat = mode == .processing ? 0.42 : 1
         barsAlpha += (alphaTarget - barsAlpha) * (1 - exp(-CGFloat(dt) / 0.09))
         barsLayer.opacity = Float(barsAlpha)
+
+        if captionFadeCount > 0 {
+            captionFadeElapsed += dt
+            let end = VoiceHUDMetrics.captionFadeDuration + VoiceHUDMetrics.captionMaxStagger
+            if captionFadeElapsed >= end { captionFadeCount = 0 }
+            renderCaption()
+        }
 
         if mode == .processing {
             let head = reduceMotion ? 0 : Int(clock * 12) % spokeLayers.count

@@ -46,6 +46,11 @@ public final class VoiceSessionController {
     private var latestLevel: Float = 0
     private var latestPartial: String = ""
     private var latestTentativeCount = 0
+    private var timeline = VoiceSessionTimeline()
+    /// The microphone is starting off the main thread; a release or Esc can arrive meanwhile.
+    private var isStarting = false
+    private var stopRequestedWhileStarting = false
+    private var startAborted = false
     private var activeRecorder: VoiceAudioRecorder?
     private var activeStream: VoiceWhisperStreamSession?
     private var sessionGeneration: UInt64 = 0
@@ -69,7 +74,7 @@ public final class VoiceSessionController {
 
     public func cancelForChord() {
         cancelPendingHold()
-        if phase == .recording { cancelCurrentSession(showNotice: false) }
+        if phase == .recording || isStarting { cancelCurrentSession(showNotice: false) }
     }
 
     public func showExternalNotice(_ message: String) {
@@ -91,7 +96,7 @@ public final class VoiceSessionController {
             return false
         }
 
-        if event.type == .keyDown && event.keyCode == 0x35 && phase != .idle {
+        if event.type == .keyDown && event.keyCode == 0x35 && (phase != .idle || isStarting) {
             cancelCurrentSession(showNotice: true)
             return true
         }
@@ -143,11 +148,13 @@ public final class VoiceSessionController {
         if event.keyCode == targetKeyCode {
             let isDown = flags.contains(targetFlag) && flags.subtracting([targetFlag, .capsLock]).isEmpty
             if isDown {
-                if phase == .idle && pendingHoldKeyCode == nil {
+                if phase == .idle && pendingHoldKeyCode == nil && !isStarting {
                     pendingHoldKeyCode = targetKeyCode
+                    timeline.begin()
                     let item = DispatchWorkItem { [weak self] in
                         guard let self, self.pendingHoldKeyCode == targetKeyCode, self.phase == .idle else { return }
                         self.pendingHoldKeyCode = nil
+                        self.timeline.mark(.holdFired)
                         self.startRecording(
                             caretRect: caretRectProvider(),
                             windowLevel: windowLevel,
@@ -161,6 +168,10 @@ public final class VoiceSessionController {
                 return false
             } else {
                 cancelPendingHold()
+                if isStarting {
+                    stopRequestedWhileStarting = true
+                    return true
+                }
                 if phase == .recording {
                     finishRecordingAndProcess()
                     return true
@@ -178,7 +189,7 @@ public final class VoiceSessionController {
         // With the global key, switching app or input method does not end a dictation.
         if VoiceGlobalHotkeyController.isListening { return }
         cancelPendingHold()
-        if phase == .recording {
+        if phase == .recording || isStarting {
             cancelCurrentSession(showNotice: false)
         }
     }
@@ -307,25 +318,53 @@ public final class VoiceSessionController {
         latestPartial = ""
         latestTentativeCount = 0
 
+        isStarting = true
+        stopRequestedWhileStarting = false
+        startAborted = false
+        // Show the HUD and warm the model now instead of after the microphone is up.
+        VoiceHUDPanelController.shared.show(
+            state: .recording(level: 0, elapsed: 0, partial: "", modeLabel: ""),
+            caretRect: caretRect,
+            clientWindowLevel: windowLevel
+        )
+        timeline.mark(.hudShown)
+        let warmEngine = prefs.providerMode == .local
+            ? VoiceASRRegistry.engine(for: prefs, vocabulary: context.personalVocabulary)
+            : nil
+        warmEngine?.beginSession()
+        if let warmEngine {
+            Task { @MainActor [weak self] in
+                try? await warmEngine.prepare()
+                self?.timeline.mark(.engineReady)
+            }
+        }
+
         Task { @MainActor [weak self] in
+            defer { warmEngine?.endSession() }
             guard let self else { return }
+            let failStart = { (message: String) in
+                self.isStarting = false
+                self.showNotice(message, isError: true)
+            }
             let micGranted = await Self.requestMicrophoneAccess()
             guard micGranted else {
-                self.showNotice(VoiceEngineError.microphonePermissionDenied.localizedDescription, isError: true)
+                failStart(VoiceEngineError.microphonePermissionDenied.localizedDescription)
                 return
             }
             if useAppleSpeech {
                 let speechGranted = await Self.requestSpeechRecognitionAccess()
                 guard speechGranted else {
-                    self.showNotice(VoiceEngineError.speechPermissionDenied.localizedDescription, isError: true)
+                    failStart(VoiceEngineError.speechPermissionDenied.localizedDescription)
                     return
                 }
             }
 
             let recorder = VoiceAudioRecorder()
             recorder.onAudioLevel = { [weak self] level in
+                let time = CFAbsoluteTimeGetCurrent()
                 Task { @MainActor [weak self] in
                     self?.latestLevel = level
+                    self?.timeline.mark(.firstBuffer, at: time)
                 }
             }
             recorder.onPartialTranscript = { [weak self] partial in
@@ -335,11 +374,18 @@ public final class VoiceSessionController {
             }
 
             do {
-                try recorder.start(
-                    useAppleSpeech: useAppleSpeech,
-                    appleLocale: prefs.localAppleLocale,
-                    requireOnDevice: prefs.localAppleRequireOnDevice
-                )
+                // Starting the audio engine can take a while, so it must not block the main thread.
+                let locale = prefs.localAppleLocale
+                let onDevice = prefs.localAppleRequireOnDevice
+                try await Task.detached(priority: .userInitiated) {
+                    try recorder.start(useAppleSpeech: useAppleSpeech, appleLocale: locale, requireOnDevice: onDevice)
+                }.value
+                self.timeline.mark(.micRunning)
+                self.isStarting = false
+                if self.startAborted {
+                    recorder.cancel()
+                    return
+                }
                 self.activeRecorder = recorder
                 self.phase = .recording
                 self.recordingStartTime = Date()
@@ -347,9 +393,12 @@ public final class VoiceSessionController {
                 self.startEngineStreamIfAvailable(prefs: prefs, recorder: recorder)
                 self.startHUDTimer()
                 self.refreshRecordingHUD()
+                if self.stopRequestedWhileStarting {
+                    self.finishRecordingAndProcess()
+                }
             } catch {
                 recorder.cancel()
-                self.showNotice(error.localizedDescription, isError: true)
+                failStart(error.localizedDescription)
             }
         }
     }
@@ -369,8 +418,13 @@ public final class VoiceSessionController {
                 guard let self, self.phase == .recording, self.sessionGeneration == generation else { return }
                 self.latestPartial = partial.text
                 self.latestTentativeCount = partial.tentativeCount
+                self.timeline.mark(.firstResult)
             }
         )
+        stream.onPassStarted = { [weak self] in
+            self?.timeline.mark(.firstRequest)
+            self?.timeline.countPass()
+        }
         activeStream = stream
         stream.start()
     }
@@ -378,6 +432,7 @@ public final class VoiceSessionController {
     private func finishRecordingAndProcess() {
         guard phase == .recording, let recorder = activeRecorder else { return }
         stopHUDTimer()
+        timeline.mark(.release)
         let stream = activeStream
         activeStream = nil
         let generation = sessionGeneration
@@ -507,8 +562,11 @@ public final class VoiceSessionController {
                 }
 
                 try Task.checkCancellation()
+                self.timeline.mark(.finalDone)
                 VoiceHUDPanelController.shared.hide()
                 commitHandler?(finalText, replaceSelection)
+                self.timeline.mark(.inserted)
+                self.timeline.log()
             } catch is CancellationError {
                 VoiceHUDPanelController.shared.hide()
             } catch VoiceEngineError.cancelled {
@@ -616,6 +674,7 @@ public final class VoiceSessionController {
     private func cancelCurrentSession(showNotice: Bool) {
         cancelPendingHold()
         stopHUDTimer()
+        if isStarting { startAborted = true }
         sessionGeneration &+= 1
         activeStream?.cancel()
         activeStream = nil
@@ -634,6 +693,7 @@ public final class VoiceSessionController {
     private func teardown() {
         cancelPendingHold()
         stopHUDTimer()
+        if isStarting { startAborted = true }
         sessionGeneration &+= 1
         activeStream?.cancel()
         activeStream = nil
@@ -664,6 +724,7 @@ public final class VoiceSessionController {
 
     private func refreshRecordingHUD() {
         guard phase == .recording else { return }
+        if !latestPartial.isEmpty { timeline.mark(.firstDraw) }
         let elapsed = Date().timeIntervalSince(recordingStartTime ?? Date())
         let modeLabel = VoicePreferencesStore.shared.prefs.providerMode == .cloudBYOK
             ? VoicePreferencesStore.shared.prefs.cloudPreset.displayName
