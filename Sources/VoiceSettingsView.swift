@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import SwiftUI
 
 public struct VoiceSettingsView: View {
@@ -75,7 +76,10 @@ public struct VoiceSettingsView: View {
                     )
                 }
                 triggerAndBehaviorCard
+                VoiceContextInspectorCard(inspector: VoiceContextInspectorStore.shared)
                 vocabularyAndTestCard
+            } else {
+                VoiceContextInspectorCard(inspector: VoiceContextInspectorStore.shared)
             }
         }
         .onAppear {
@@ -735,5 +739,157 @@ private struct LocalVoiceConfigCard: View {
                 voiceStore.update { $0[keyPath: keyPath] = newValue }
             }
         )
+    }
+}
+
+/// Interactive tester & inspector for Typeless-style AXUIElement + AXEnhancedUserInterface context capture.
+private struct VoiceContextInspectorCard: View {
+    @ObservedObject var inspector: VoiceContextInspectorStore
+    @State private var showRawJSON = true
+    @State private var copiedNotice = false
+    @State private var axTrusted = AXIsProcessTrusted()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("上下文抓取实测（AXUIElement）")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("按 Typeless 方式抓取前台 App、窗口标题、网页 URL、光标前后文、选区与屏幕可见文本")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                HStack(spacing: 4) {
+                    Image(systemName: axTrusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(axTrusted ? Color.green : Color.orange)
+                        .font(.system(size: 11.5))
+                    Text(axTrusted ? "辅助功能已授权" : "未授权辅助功能")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 8) {
+                if inspector.isCapturing {
+                    Button(inspector.countdownSeconds > 0 ? "切到目标 App… (\(inspector.countdownSeconds)s)" : "抓取中…") {
+                        inspector.cancelScheduledCapture()
+                    }
+                    .controlSize(.small)
+                } else {
+                    Button("3 秒后抓取前台窗口") {
+                        axTrusted = AXIsProcessTrusted()
+                        inspector.captureAfterDelay(seconds: 3)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+
+                Toggle("敏感应用/URL 黑名单", isOn: $inspector.respectBlacklist)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 11.5))
+
+                Spacer()
+
+                if !inspector.lastJSON.isEmpty {
+                    Button(copiedNotice ? "已复制" : "复制 JSON") {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        pb.setString(inspector.lastJSON, forType: .string)
+                        copiedNotice = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                            copiedNotice = false
+                        }
+                    }
+                    .controlSize(.small)
+
+                    Button(showRawJSON ? "收起 JSON" : "展开 JSON") {
+                        showRawJSON.toggle()
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            if let captured = inspector.lastCaptured {
+                let app = captured.activeApplication
+                let ip = captured.textInsertionPoint
+                let cur = ip.cursorState
+                let sur = ip.surroundingContext
+                let meta = captured.contextMetadata
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    summaryRow("应用", "\(app.appName.isEmpty ? "(未知)" : app.appName) · \(app.appIdentifier) (\(app.appType)) · \(meta.elapsedMs) ms")
+                    if !app.windowTitle.isEmpty {
+                        summaryRow("窗口", app.windowTitle)
+                    }
+                    if let url = app.webURL {
+                        summaryRow("URL", url)
+                    }
+                    summaryRow(
+                        "状态",
+                        "enhancedUI=\(meta.enhancedUIEnabled ? "是" : "否") · role=\(ip.accessibilityRole.isEmpty ? "无" : ip.accessibilityRole) · editable=\(ip.inputCapabilities.isEditable ? "是" : "否")\(meta.isBlacklisted ? " · 命中黑名单(\(meta.blacklistReason ?? ""))" : "")\(meta.isSecureInput ? " · 密码框已跳过" : "")"
+                    )
+                    if !cur.selectedText.isEmpty {
+                        summaryRow("选区", compactPreview(cur.selectedText))
+                    }
+                    if !cur.textBeforeCursor.isEmpty || !cur.textAfterCursor.isEmpty {
+                        summaryRow("光标前/后", "前(\(cur.textBeforeCursor.count)字)：\(compactPreview(cur.textBeforeCursor, limit: 60)) | 后(\(cur.textAfterCursor.count)字)：\(compactPreview(cur.textAfterCursor, limit: 40))")
+                    }
+                    if !sur.textBeforeInputArea.isEmpty || !sur.textAfterInputArea.isEmpty {
+                        summaryRow("周边上下文", "上(\(sur.textBeforeInputArea.count)字) / 下(\(sur.textAfterInputArea.count)字)")
+                    }
+                    let visCount = app.visibleScreenContent?.count ?? 0
+                    summaryRow("屏幕可见文本", visCount > 0 ? "\(visCount) 字：\(compactPreview(app.visibleScreenContent ?? "", limit: 80))" : (meta.isBlacklisted ? "黑名单跳过" : "无"))
+                }
+
+                if showRawJSON {
+                    ScrollView([.vertical, .horizontal]) {
+                        Text(inspector.lastJSON)
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(maxHeight: 210)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            } else {
+                Text("点击「3 秒后抓取前台窗口」后切到 Chrome / Slack / Cursor / 微信等任意应用，或在任意窗口按右 Command 语音输入，即可在此看到实时抓取结果。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
+        )
+        .onAppear { axTrusted = AXIsProcessTrusted() }
+    }
+
+    private func summaryRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+            Text(value)
+                .font(.system(size: 11))
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func compactPreview(_ s: String, limit: Int = 90) -> String {
+        let oneLine = s.replacingOccurrences(of: "\n", with: " ⏎ ")
+        if oneLine.count <= limit { return oneLine }
+        return String(oneLine.prefix(limit)) + "…"
     }
 }
