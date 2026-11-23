@@ -414,18 +414,34 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
         if let channelData = buffer.floatChannelData?[0] {
             let count = Int(buffer.frameLength)
             if count > 0 {
-                var sum: Float = 0
-                for i in 0..<count {
-                    let s = channelData[i]
-                    sum += s * s
+                // CoreAudio tap buffers are often ~100 ms; slicing into ~25 ms windows keeps
+                // brief pauses tracking the noise floor while preserving syllable loudness peaks.
+                let sampleRate = buffer.format.sampleRate
+                let step = max(1, Int((sampleRate * 0.025).rounded()))
+                var peakLevel: Float = 0
+                var totalSum: Float = 0
+                var offset = 0
+                while offset < count {
+                    let end = min(count, offset + step)
+                    let chunk = end - offset
+                    var sum: Float = 0
+                    for i in offset..<end {
+                        let s = channelData[i]
+                        sum += s * s
+                    }
+                    totalSum += sum
+                    let rms = sqrt(sum / Float(chunk))
+                    let seconds = Float(Double(chunk) / sampleRate)
+                    let level = levelMeter.process(rms: rms, seconds: seconds)
+                    if level > peakLevel { peakLevel = level }
+                    offset = end
                 }
-                let rms = sqrt(sum / Float(count))
-                let seconds = Float(Double(count) / buffer.format.sampleRate)
-                let bucket = Int((20 * log10(max(rms, 1e-6))).rounded()) + 90
+                let bufferRMS = sqrt(totalSum / Float(count))
+                let bucket = Int((20 * log10(max(bufferRMS, 1e-6))).rounded()) + 90
                 lock.lock()
                 levelHistogram[max(0, min(90, bucket))] += 1
                 lock.unlock()
-                onAudioLevel?(levelMeter.process(rms: rms, seconds: seconds))
+                onAudioLevel?(peakLevel)
             }
         }
 

@@ -426,16 +426,27 @@ struct SwiftBridgeTests {
         precondition(testBoard.data(forType: NSPasteboard.PasteboardType("com.juxu.test")) == Data([1, 2, 3]), "every clipboard type is restored")
         testBoard.releaseGlobally()
 
-        // The HUD meter separates loudness on a dB scale and leaves room noise at rest.
-        let meterLevel = { (rms: Float) -> Float in
-            var meter = VoiceLevelMeter()
-            for _ in 0..<50 { _ = meter.process(rms: 0.001, seconds: 0.02) }
-            return meter.process(rms: rms, seconds: 0.02)
+        // The HUD meter separates loudness on a dB scale across both laptop and close-up mics.
+        let rmsFromDB = { (db: Float) -> Float in pow(10, db / 20) }
+        var laptopMeter = VoiceLevelMeter()
+        for _ in 0..<10 { _ = laptopMeter.process(rms: rmsFromDB(-41.5), seconds: 0.1) }
+        let laptopSteps: [Float] = ([-41.5, -36, -32, -29, -25] as [Float]).map { db in
+            var out: Float = 0
+            for _ in 0..<4 { out = laptopMeter.process(rms: rmsFromDB(db), seconds: 0.1) }
+            return out
         }
-        let meterSteps = [0.001, 0.006, 0.02, 0.06, 0.15, 0.32].map { meterLevel(Float($0)) }
-        precondition(meterSteps[0] == 0, "room noise stays at rest")
-        precondition(zip(meterSteps, meterSteps.dropFirst()).allSatisfy { $0 < $1 }, "louder speech always draws higher")
-        precondition(meterLevel(0.118) < 0.85, "the old saturation point no longer pins the bars")
+        precondition(laptopSteps[0] == 0, "laptop room noise stays at rest")
+        precondition(zip(laptopSteps, laptopSteps.dropFirst()).allSatisfy { $0 < $1 }, "louder speech always draws higher on laptop mic")
+        precondition(laptopSteps[2] >= 0.35 && laptopSteps[4] >= 0.85, "laptop speech spans a clear visual range")
+
+        var closeMicMeter = VoiceLevelMeter()
+        for _ in 0..<10 { _ = closeMicMeter.process(rms: rmsFromDB(-56), seconds: 0.1) }
+        precondition(closeMicMeter.process(rms: rmsFromDB(-56), seconds: 0.1) == 0, "quiet room stays at rest")
+        for _ in 0..<6 { _ = closeMicMeter.process(rms: rmsFromDB(-12), seconds: 0.1) }
+        let closeLoud = closeMicMeter.process(rms: rmsFromDB(-12), seconds: 0.1)
+        let closeNormal = closeMicMeter.process(rms: rmsFromDB(-26), seconds: 0.1)
+        let closeWhisper = closeMicMeter.process(rms: rmsFromDB(-42), seconds: 0.1)
+        precondition(closeWhisper > 0.05 && closeWhisper < closeNormal && closeNormal < closeLoud, "adaptive ceiling separates whisper, normal and loud speech on hot mics")
 
         // Hold logic, fed the same synthetic events a listener would deliver. The microphone is never started.
         VoicePreferencesStore.shared.update({ $0.enabled = true; $0.triggerKey = .rightCommand }, persist: false)

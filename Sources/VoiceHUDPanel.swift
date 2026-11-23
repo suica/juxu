@@ -493,18 +493,21 @@ final class VoiceHUDContentView: NSView {
 }
 
 /// Maps microphone loudness to a 0...1 display level on a decibel scale, so whisper, normal and
-/// loud speech look different. A slow noise-floor estimate keeps room noise at rest.
+/// loud speech look different across both quiet far-field laptop mics and loud close-up mics.
+/// A slow noise-floor estimate keeps room noise at rest, and an adaptive peak ceiling tracks
+/// louder microphones upward without pinning normal speech.
 /// Display only: it never touches the audio given to the recogniser or the speech gate.
 struct VoiceLevelMeter {
-    static let ceilingDB: Float = -8
-    static let quietestDB: Float = -52
-    static let lowestFloorDB: Float = -61
-    static let highestFloorDB: Float = -42
-    static let floorMarginDB: Float = 8
-    /// Above 1 this spreads normal and loud speech apart instead of bunching them near the top.
-    static let contrast: Float = 1.4
+    static let quietestDB: Float = -58
+    static let lowestFloorDB: Float = -65
+    static let highestFloorDB: Float = -41
+    static let floorMarginDB: Float = 3.5
+    static let minSpanDB: Float = 12
+    static let initialCeilingDB: Float = -25
+    static let maxCeilingDB: Float = -4
 
     private(set) var noiseFloorDB: Float?
+    private(set) var peakCeilingDB: Float?
 
     mutating func process(rms: Float, seconds: Float) -> Float {
         let db = 20 * log10(max(rms, 1e-6))
@@ -517,7 +520,18 @@ struct VoiceLevelMeter {
             noiseFloorDB = clamped
         }
         let bottom = max(Self.quietestDB, (noiseFloorDB ?? Self.lowestFloorDB) + Self.floorMarginDB)
-        return pow(max(0, min(1, (db - bottom) / (Self.ceilingDB - bottom))), Self.contrast)
+        let minTop = min(Self.maxCeilingDB, max(bottom + Self.minSpanDB, Self.initialCeilingDB))
+        let targetPeak = min(Self.maxCeilingDB, max(minTop, db))
+        if let peak = peakCeilingDB {
+            // Expands quickly for loud close-up mics and relaxes slowly so transient peaks
+            // keep loud-vs-soft contrast visible.
+            let tau: Float = targetPeak > peak ? 0.25 : 5
+            peakCeilingDB = peak + (targetPeak - peak) * (1 - exp(-seconds / tau))
+        } else {
+            peakCeilingDB = minTop
+        }
+        let top = max(minTop, peakCeilingDB ?? minTop)
+        return max(0, min(1, (db - bottom) / (top - bottom)))
     }
 }
 
