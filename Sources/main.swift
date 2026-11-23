@@ -135,6 +135,12 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
         // Initialize shared Rust mmap core eagerly (< 1ms) so first keystroke has 0ms cold latency
         _ = JuxuBridge.shared
 
+        // Nothing is created unless the user turned on the global voice key.
+        let voicePrefs = VoicePreferencesStore.shared.prefs
+        if voicePrefs.enabled, voicePrefs.isGlobalHotkeyEnabled {
+            VoiceGlobalHotkeyController.sync(with: voicePrefs)
+        }
+
         // Allow launching standalone settings UI via `--settings`
         if CommandLine.arguments.contains("--settings") {
             SettingsWindowController.shared.show()

@@ -245,6 +245,10 @@ public struct VoicePreferences: Codable, Equatable, Sendable {
     public var localHTTPLLMBaseURL: String = "http://127.0.0.1:11434/v1"
     public var localHTTPLLMModel: String = "qwen2.5:3b"
 
+    /// Optional so existing voice.json files still decode, and stay unchanged while it is off.
+    public var globalVoiceHotkey: Bool?
+    public var isGlobalHotkeyEnabled: Bool { globalVoiceHotkey ?? false }
+
     public init() {}
 
     public var effectiveCloudASRBaseURL: String {
@@ -394,6 +398,9 @@ public final class VoicePreferencesStore: ObservableObject {
         if wasEnabled && !newPrefs.enabled {
             VoiceSessionController.unload()
             VoiceLocalInstaller.unload()
+        }
+        if self === VoicePreferencesStore.shared {
+            VoiceGlobalHotkeyController.sync(with: newPrefs)
         }
     }
 

@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 public struct VoiceSettingsView: View {
+    @State private var globalPermissions = VoiceGlobalPermissions(inputMonitoring: false, accessibility: false)
     @ObservedObject public var bridge: JuxuBridge
     @ObservedObject public var voiceStore: VoicePreferencesStore
 
@@ -254,6 +255,71 @@ public struct VoiceSettingsView: View {
 
     // MARK: - Trigger & Behavior
 
+    private var globalHotkeyBinding: Binding<Bool> {
+        Binding(
+            get: { voiceStore.prefs.isGlobalHotkeyEnabled },
+            set: { isOn in
+                voiceStore.update { $0.globalVoiceHotkey = isOn ? true : nil }
+                if isOn { VoiceGlobalPermissions.request() }
+                globalPermissions = VoiceGlobalPermissions.current()
+            }
+        )
+    }
+
+    private var globalHotkeyRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("全局语音快捷键")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("在任何应用里按住语音键，即使当前输入法不是句序")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle("", isOn: globalHotkeyBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+            if voiceStore.prefs.isGlobalHotkeyEnabled {
+                if !voiceStore.prefs.triggerKey.isHoldToTalk {
+                    Text("全局模式需要长按类触发键，请改选右 Option、右 Command 或 Fn")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.orange)
+                }
+                globalPermissionRow("输入监控（监听语音键）", granted: globalPermissions.inputMonitoring, pane: VoiceGlobalPermissions.inputMonitoringPane)
+                globalPermissionRow("辅助功能（写入其他应用）", granted: globalPermissions.accessibility, pane: VoiceGlobalPermissions.accessibilityPane)
+                if !globalPermissions.inputMonitoring || !globalPermissions.accessibility {
+                    Text("如果列表里已勾选句序仍显示未授权，通常是应用更新后签名变化：请移除句序后重新添加。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onAppear { globalPermissions = VoiceGlobalPermissions.current() }
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            guard voiceStore.prefs.isGlobalHotkeyEnabled else { return }
+            globalPermissions = VoiceGlobalPermissions.current()
+        }
+    }
+
+    private func globalPermissionRow(_ title: String, granted: Bool, pane: URL) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle")
+                .foregroundStyle(granted ? Color.green : Color.orange)
+                .font(.system(size: 12))
+            Text(title + (granted ? "：已授权" : "：未授权"))
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if !granted {
+                Button("打开系统设置") { NSWorkspace.shared.open(pane) }
+                    .controlSize(.small)
+            }
+        }
+    }
+
     private var triggerAndBehaviorCard: some View {
         card {
             VStack(spacing: 11) {
@@ -274,6 +340,10 @@ public struct VoiceSettingsView: View {
                     .labelsHidden()
                     .frame(width: 205)
                 }
+
+                Divider()
+
+                globalHotkeyRow
 
                 Divider()
 
