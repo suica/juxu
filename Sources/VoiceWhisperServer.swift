@@ -137,6 +137,10 @@ public enum VoiceSpeechGate {
     /// A short run, such as one spoken word, must also be clearly louder than background murmur.
     static let shortRunFrames = 10
     static let shortRunLevel: Float = 120
+    /// Below this much audio, the clip's own level statistics cannot tell speech from background.
+    static let earlyWindowSeconds = 1.0
+    /// In such a window the floor may be speech, so it can only raise the threshold this far.
+    static let earlyFloorCap: Float = 200
 
     private static let hann: [Float] = (0..<windowSamples).map {
         Float(0.5 - 0.5 * cos(2 * Double.pi * Double($0) / Double(windowSamples - 1)))
@@ -190,7 +194,7 @@ public enum VoiceSpeechGate {
     }
 
     /// Per-frame flags, true only inside runs that look like speech.
-    public static func voicedFrames(_ samples: [Int16]) -> [Bool] {
+    public static func voicedFrames(_ samples: [Int16], trustNoiseFloor: Bool = true) -> [Bool] {
         let (levels, voicing) = frameFeatures(samples)
         guard !levels.isEmpty else { return [] }
         var flags = [Bool](repeating: false, count: levels.count)
@@ -199,7 +203,8 @@ public enum VoiceSpeechGate {
         let lower = Int(position)
         let upper = min(lower + 1, sorted.count - 1)
         let floor = sorted[lower] + (sorted[upper] - sorted[lower]) * (position - Float(lower))
-        let threshold = max(minLevel, floor * noiseFloorRatio)
+        let floorThreshold = floor * noiseFloorRatio
+        let threshold = max(minLevel, trustNoiseFloor ? floorThreshold : min(floorThreshold, earlyFloorCap))
         let voiced = levels.indices.filter { voicing[$0] >= voicingThreshold && levels[$0] >= threshold }
         guard voiced.count >= shortRunFrames else { return flags }
 
@@ -226,8 +231,13 @@ public enum VoiceSpeechGate {
         return flags
     }
 
-    static func speechSlice(_ samples: [Int16], leadSeconds: Double, tailSeconds: Double) -> (audio: [Int16], voicedSeconds: Double)? {
-        let flags = voicedFrames(samples)
+    static func speechSlice(
+        _ samples: [Int16],
+        leadSeconds: Double,
+        tailSeconds: Double,
+        trustNoiseFloor: Bool = true
+    ) -> (audio: [Int16], voicedSeconds: Double)? {
+        let flags = voicedFrames(samples, trustNoiseFloor: trustNoiseFloor)
         guard let first = flags.firstIndex(of: true), let last = flags.lastIndex(of: true) else { return nil }
         let rate = Double(VoiceWhisperStreamPolicy.sampleRate)
         let start = max(0, first * hopSamples - Int(leadSeconds * rate))
@@ -241,7 +251,14 @@ public enum VoiceSpeechGate {
         _ window: [Int16],
         minVoicedSeconds: Double = VoicePartialCadence.standard.minVoicedSeconds
     ) -> [Int16]? {
-        guard let slice = speechSlice(window, leadSeconds: 0.2, tailSeconds: 0.3),
+        // A short window that starts mid-word has no quiet frames, so its "noise floor" is really speech.
+        let seconds = Double(window.count) / Double(VoiceWhisperStreamPolicy.sampleRate)
+        guard let slice = speechSlice(
+            window,
+            leadSeconds: 0.2,
+            tailSeconds: 0.3,
+            trustNoiseFloor: seconds >= earlyWindowSeconds
+        ),
               slice.voicedSeconds >= minVoicedSeconds else { return nil }
         return slice.audio
     }
