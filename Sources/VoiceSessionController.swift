@@ -28,6 +28,7 @@ public final class VoiceSessionController {
         _shared?.teardown()
         _shared = nil
         VoiceHUDPanelController.unload()
+        VoiceWhisperServerManager.unload()
     }
 
     private enum Phase {
@@ -44,6 +45,8 @@ public final class VoiceSessionController {
     private var latestLevel: Float = 0
     private var latestPartial: String = ""
     private var activeRecorder: VoiceAudioRecorder?
+    private var activeStream: VoiceWhisperStreamSession?
+    private var sessionGeneration: UInt64 = 0
     private var pipelineClient: VoicePipelineClient?
     private var activeTask: Task<Void, Never>?
     private var activeCaretRect: NSRect = .zero
@@ -317,6 +320,8 @@ public final class VoiceSessionController {
                 self.activeRecorder = recorder
                 self.phase = .recording
                 self.recordingStartTime = Date()
+                self.sessionGeneration &+= 1
+                self.startWhisperStreamIfAvailable(prefs: prefs, recorder: recorder)
                 self.startHUDTimer()
                 self.refreshRecordingHUD()
             } catch {
@@ -326,9 +331,38 @@ public final class VoiceSessionController {
         }
     }
 
+    /// Starts resident-model partials for local Whisper. If unavailable, dictation simply uses the CLI on release.
+    private func startWhisperStreamIfAvailable(prefs: VoicePreferences, recorder: VoiceAudioRecorder) {
+        guard prefs.providerMode == .local,
+              prefs.localASRPreset == .whisperTurbo || prefs.localASRPreset == .whisperBase,
+              let serverBinary = VoiceWhisperServerManager.detectServerBinary() else { return }
+        let status = VoiceLocalInstaller.asrStatus(for: prefs.localASRPreset)
+        guard status.isReady, let modelPath = status.modelPath else { return }
+
+        let manager = VoiceWhisperServerManager.shared
+        manager.configure(binaryPath: serverBinary, modelPath: modelPath, language: prefs.language)
+        let generation = sessionGeneration
+        let stream = VoiceWhisperStreamSession(
+            transcriber: manager,
+            language: prefs.language,
+            sampleProvider: { [weak recorder] maxCount in
+                recorder?.snapshotRecentSamples(maxCount: maxCount) ?? ([], 0)
+            },
+            onPartial: { [weak self] partial in
+                guard let self, self.phase == .recording, self.sessionGeneration == generation else { return }
+                self.latestPartial = partial
+            }
+        )
+        activeStream = stream
+        stream.start()
+    }
+
     private func finishRecordingAndProcess() {
         guard phase == .recording, let recorder = activeRecorder else { return }
         stopHUDTimer()
+        let stream = activeStream
+        activeStream = nil
+        let generation = sessionGeneration
         let samples = recorder.stopAndCollectSamples()
         let elapsed = Date().timeIntervalSince(recordingStartTime ?? Date())
         phase = .processing
@@ -344,6 +378,7 @@ public final class VoiceSessionController {
             && !(context.selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
         if elapsed < 0.25 && samples.count < 3200 && latestPartial.isEmpty {
+            stream?.cancel()
             recorder.cancel()
             activeRecorder = nil
             phase = .idle
@@ -365,9 +400,13 @@ public final class VoiceSessionController {
         activeTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                self.activeRecorder = nil
-                self.activeTask = nil
-                self.phase = .idle
+                stream?.cancel()
+                // A cancelled task may finish after a newer session started; leave that session alone.
+                if self.sessionGeneration == generation {
+                    self.activeRecorder = nil
+                    self.activeTask = nil
+                    self.phase = .idle
+                }
             }
 
             do {
@@ -375,14 +414,51 @@ public final class VoiceSessionController {
                 if useAppleSpeech {
                     rawTranscript = try await recorder.finishAppleSpeech()
                 } else {
-                    let wavData = VoiceWAVEncoder.encodePCM16Mono(samples: samples, sampleRate: 16_000)
-                    rawTranscript = try await self.runNonAppleASR(
-                        prefs: prefs,
-                        client: client,
-                        asrKey: asrKey,
-                        wavData: wavData,
-                        vocabulary: context.personalVocabulary
-                    )
+                    // Local Whisper invents text for silence, so it only ever receives detected speech.
+                    let isLocalWhisper = prefs.providerMode == .local
+                        && (prefs.localASRPreset == .whisperTurbo || prefs.localASRPreset == .whisperBase)
+                    var audio = samples
+                    var voicedSeconds = 0.0
+                    if isLocalWhisper {
+                        guard let speech = VoiceSpeechGate.finalAudio(samples) else {
+                            throw VoiceEngineError.noSpeechDetected
+                        }
+                        audio = speech.audio
+                        voicedSeconds = speech.voicedSeconds
+                    }
+                    let wavData = VoiceWAVEncoder.encodePCM16Mono(samples: audio, sampleRate: 16_000)
+                    var residentText: String?
+                    if let stream {
+                        do {
+                            residentText = try await stream.finish(wavData: wavData, sampleCount: audio.count)
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            try Task.checkCancellation()
+                            VoiceWhisperServerManager.sharedIfLoaded?.stop()
+                        }
+                    }
+                    if let residentText {
+                        rawTranscript = residentText
+                    } else {
+                        let cliText = try await self.runNonAppleASR(
+                            prefs: prefs,
+                            client: client,
+                            asrKey: asrKey,
+                            wavData: wavData,
+                            vocabulary: context.personalVocabulary
+                        )
+                        rawTranscript = isLocalWhisper
+                            ? VoiceHallucinationFilter.filtered(
+                                VoiceWhisperStreamPolicy.simplified(cliText, language: prefs.language),
+                                voicedSeconds: voicedSeconds
+                            )
+                            : cliText
+                    }
+                    if isLocalWhisper,
+                       rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        throw VoiceEngineError.noSpeechDetected
+                    }
                 }
 
                 try Task.checkCancellation()
@@ -416,6 +492,8 @@ public final class VoiceSessionController {
                 VoiceHUDPanelController.shared.hide()
             } catch VoiceEngineError.cancelled {
                 VoiceHUDPanelController.shared.hide()
+            } catch VoiceEngineError.noSpeechDetected {
+                self.showNotice(VoiceEngineError.noSpeechDetected.localizedDescription, isError: false, duration: 1.4)
             } catch {
                 self.showNotice(error.localizedDescription, isError: true, duration: 3.2)
             }
@@ -526,6 +604,9 @@ public final class VoiceSessionController {
     private func cancelCurrentSession(showNotice: Bool) {
         cancelPendingHold()
         stopHUDTimer()
+        sessionGeneration &+= 1
+        activeStream?.cancel()
+        activeStream = nil
         activeTask?.cancel()
         activeTask = nil
         activeRecorder?.cancel()
@@ -541,6 +622,9 @@ public final class VoiceSessionController {
     private func teardown() {
         cancelPendingHold()
         stopHUDTimer()
+        sessionGeneration &+= 1
+        activeStream?.cancel()
+        activeStream = nil
         activeTask?.cancel()
         activeTask = nil
         activeRecorder?.cancel()
@@ -552,7 +636,7 @@ public final class VoiceSessionController {
 
     private func startHUDTimer() {
         stopHUDTimer()
-        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshRecordingHUD()
             }

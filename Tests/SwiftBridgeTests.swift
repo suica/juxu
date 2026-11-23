@@ -258,6 +258,31 @@ struct SwiftBridgeTests {
         assert(!VoiceSessionController.isLoaded, "VoiceSessionController must NOT be loaded before voice is enabled")
         assert(!VoiceHUDPanelController.isLoaded, "VoiceHUDPanelController must NOT be loaded before voice is enabled")
         assert(!VoiceLocalInstaller.isLoaded, "VoiceLocalInstaller must NOT be loaded before voice is enabled")
+        precondition(!VoiceWhisperServerManager.isLoaded, "whisper-server manager must NOT be loaded before voice is enabled")
+        precondition(VoiceWhisperStreamPolicy.normalizedTranscript("今天开会\n 明天发布\n") == "今天开会明天发布")
+        precondition(VoiceWhisperStreamPolicy.normalizedTranscript("hello\nworld") == "hello world")
+        precondition(VoiceSpeechGate.finalAudio([Int16](repeating: 0, count: 48_000)) == nil, "digital silence is not speech")
+        precondition(VoiceSpeechGate.finalAudio([Int16](repeating: 1_000, count: 48_000)) == nil, "a steady level is not speech")
+        var clicks = [Int16](repeating: 5, count: 48_000)
+        for c in 0..<9 { for j in 0..<160 { clicks[3_000 + c * 5_000 + j] = 9_000 } }
+        precondition(VoiceSpeechGate.finalAudio(clicks) == nil, "isolated key clicks are not speech")
+        var burst = [Int16](repeating: 5, count: 48_000)
+        for i in 16_000..<24_000 { burst[i] = i % 2 == 0 ? 3_000 : -3_000 }
+        precondition(VoiceSpeechGate.finalAudio(burst)?.audio.count == 8_000 + 4_800 + 8_000, "speech is kept with padding")
+        precondition(VoiceHallucinationFilter.shouldDrop("请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", voicedSeconds: 0.3))
+        precondition(VoiceHallucinationFilter.shouldDrop("字幕志愿者 杨栋梁", voicedSeconds: 0))
+        precondition(!VoiceHallucinationFilter.shouldDrop("请大家点赞订阅转发", voicedSeconds: 1.6), "a person really saying it keeps it")
+        precondition(!VoiceHallucinationFilter.shouldDrop("这个视频的点赞和转发数据不错", voicedSeconds: 0), "ordinary sentences are never credits")
+        precondition(VoiceHallucinationFilter.filtered("今天下午三点我们开会讨论一下新版本的发布计划\n请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", voicedSeconds: 4.2) == "今天下午三点我们开会讨论一下新版本的发布计划", "a credit line cannot borrow real speech as evidence")
+        precondition(VoiceHallucinationFilter.filtered("请大家点赞订阅转发", voicedSeconds: 1.6) == "请大家点赞订阅转发")
+        precondition(VoiceWhisperStreamPolicy.simplified("今天下午三點我們開", language: "zh") == "今天下午三点我们开")
+        precondition(VoiceWhisperStreamPolicy.simplified("之後對於這個問題是什麼", language: "zh") == "之后对于这个问题是什么")
+        let latinAndPunctuation = "Hello World 123, GPT-4 v2.1 (test) 100%! ,.?;:，。！？、《》"
+        precondition(VoiceWhisperStreamPolicy.simplified(latinAndPunctuation, language: "zh") == latinAndPunctuation)
+        let validSimplified = "俱乐部 摔跤 狼藉 姊妹 乾隆 乾坤 著名 瞭望 大阪 苎麻 叱吒 钳子 酒麴 折叠 于是 头发 里面 皇后 云彩 一只 几个 准备"
+        precondition(VoiceWhisperStreamPolicy.simplified(validSimplified, language: "zh") == validSimplified)
+        precondition(VoiceWhisperStreamPolicy.simplified("三點", language: "en") == "三點", "only zh is converted")
+        precondition(VoiceHallucinationFilter.shouldDrop(VoiceWhisperStreamPolicy.simplified("請不吝點贊 訂閱 轉發 打賞支持明鏡與點點欄目", language: "zh"), voicedSeconds: 0.3))
 
         let defaultVoice = VoicePreferences()
         assert(defaultVoice.cloudPreset == .groq)
@@ -288,12 +313,14 @@ struct SwiftBridgeTests {
         // Trigger lazy load and verify disabling voice unloads session, HUD, and local installer
         _ = VoiceSessionController.shared
         _ = VoiceLocalInstaller.shared
+        _ = VoiceWhisperServerManager.shared
         assert(VoiceSessionController.isLoaded)
         assert(VoiceLocalInstaller.isLoaded)
         reloadedStore.update { $0.enabled = false }
         assert(!VoiceSessionController.isLoaded, "Disabling voice must unload VoiceSessionController")
         assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
         assert(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
+        precondition(!VoiceWhisperServerManager.isLoaded, "Disabling voice must unload the whisper-server manager")
 
         // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
         let defaultVoiceLLM = VoicePreferences()

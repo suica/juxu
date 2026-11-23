@@ -30,6 +30,7 @@ public enum VoiceEngineError: LocalizedError, Sendable {
     case invalidEndpoint(String)
     case recordingTooShort
     case emptyTranscript
+    case noSpeechDetected
     case cliNotFound(String)
     case cliFailed(String)
     case networkError(String)
@@ -53,6 +54,8 @@ public enum VoiceEngineError: LocalizedError, Sendable {
             return "录音过短，已忽略"
         case .emptyTranscript:
             return "未识别到有效语音内容"
+        case .noSpeechDetected:
+            return "没听清"
         case .cliNotFound(let bin):
             return "未找到本地 Whisper 命令：\(bin)"
         case .cliFailed(let msg):
@@ -461,6 +464,14 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
         pcm16Samples.removeAll(keepingCapacity: false)
         lock.unlock()
         return out
+    }
+
+    /// Copies at most the newest `maxCount` samples while recording continues.
+    public func snapshotRecentSamples(maxCount: Int) -> (samples: [Int16], total: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let total = pcm16Samples.count
+        return (Array(pcm16Samples.suffix(max(0, maxCount))), total)
     }
 
     public func finishAppleSpeech(timeoutSeconds: Double = 3.5) async throws -> String {

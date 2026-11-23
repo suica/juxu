@@ -142,6 +142,7 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        VoiceWhisperServerManager.sharedIfLoaded?.stop()
         JuxuBridge.shared.flushUserDataIfNeeded()
     }
 }
