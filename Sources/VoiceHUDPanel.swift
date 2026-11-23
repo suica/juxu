@@ -448,9 +448,9 @@ final class VoiceHUDContentView: NSView {
         let levelTau: CGFloat = targetLevel > smoothedLevel ? 0.03 : 0.13
         smoothedLevel += (targetLevel - smoothedLevel) * (1 - exp(-CGFloat(dt) / levelTau))
 
+        // The level is already perceptual (see VoiceLevelMeter), so it maps straight to height.
         // Below the gate the bars collapse to a straight line of dots.
-        let gated = max(0, (smoothedLevel - 0.04) / 0.96)
-        let energy = pow(gated, 0.65)
+        let energy = max(0, (smoothedLevel - 0.02) / 0.98)
         let dot = VoiceHUDMetrics.barWidth
         let span = VoiceHUDMetrics.barMaxHeight - dot
 
@@ -489,6 +489,35 @@ final class VoiceHUDContentView: NSView {
             }
         }
         CATransaction.commit()
+    }
+}
+
+/// Maps microphone loudness to a 0...1 display level on a decibel scale, so whisper, normal and
+/// loud speech look different. A slow noise-floor estimate keeps room noise at rest.
+/// Display only: it never touches the audio given to the recogniser or the speech gate.
+struct VoiceLevelMeter {
+    static let ceilingDB: Float = -8
+    static let quietestDB: Float = -52
+    static let lowestFloorDB: Float = -61
+    static let highestFloorDB: Float = -42
+    static let floorMarginDB: Float = 8
+    /// Above 1 this spreads normal and loud speech apart instead of bunching them near the top.
+    static let contrast: Float = 1.4
+
+    private(set) var noiseFloorDB: Float?
+
+    mutating func process(rms: Float, seconds: Float) -> Float {
+        let db = 20 * log10(max(rms, 1e-6))
+        let clamped = min(Self.highestFloorDB, max(Self.lowestFloorDB, db))
+        if let floor = noiseFloorDB {
+            // Falls quickly into pauses, rises slowly so sustained speech is not taken for noise.
+            let tau: Float = clamped < floor ? 0.15 : 6
+            noiseFloorDB = floor + (clamped - floor) * (1 - exp(-seconds / tau))
+        } else {
+            noiseFloorDB = clamped
+        }
+        let bottom = max(Self.quietestDB, (noiseFloorDB ?? Self.lowestFloorDB) + Self.floorMarginDB)
+        return pow(max(0, min(1, (db - bottom) / (Self.ceilingDB - bottom))), Self.contrast)
     }
 }
 
