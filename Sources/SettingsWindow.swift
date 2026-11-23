@@ -1016,6 +1016,30 @@ struct TouchKeyboardSimulatorView: View {
 }
 
 @MainActor
+final class SettingsWindow: NSWindow {
+    static func isCloseWindowShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let modifiers = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .option, .control, .shift])
+        guard modifiers == .command else { return false }
+        return event.charactersIgnoringModifiers?.lowercased() == "w"
+            || event.characters?.lowercased() == "w"
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if super.performKeyEquivalent(with: event) {
+            return true
+        }
+        if Self.isCloseWindowShortcut(event) {
+            performClose(nil)
+            return true
+        }
+        return false
+    }
+}
+
+@MainActor
 public final class SettingsWindowController {
     public static let shared = SettingsWindowController()
     private var window: NSWindow?
@@ -1024,7 +1048,7 @@ public final class SettingsWindowController {
 
     public func show(section: SettingsSection = .schema) {
         if window == nil {
-            let win = NSWindow(
+            let win = SettingsWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
