@@ -376,7 +376,7 @@ public final class VoiceGlobalHotkeyController {
             flags: nsEvent.modifierFlags.intersection(.deviceIndependentFlagsMask),
             trigger: prefs.triggerKey,
             isSecureInput: IsSecureEventInputEnabled(),
-            isRecording: session.isRecording
+            isRecording: session.isCapturing
         )
         switch decision {
         case .ignore:

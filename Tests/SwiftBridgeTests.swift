@@ -427,7 +427,9 @@ struct SwiftBridgeTests {
         VoicePreferencesStore.shared.update({ $0.enabled = true; $0.triggerKey = .rightCommand }, persist: false)
         let holdSession = VoiceSessionController.shared
         var holdStarts = 0
+        var holdFinishes = 0
         holdSession.startRecordingOverride = { holdStarts += 1 }
+        holdSession.finishRecordingOverride = { holdFinishes += 1 }
         let command = { (down: Bool) -> NSEvent in
             let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x36, keyDown: down)!
             e.type = .flagsChanged
@@ -442,25 +444,42 @@ struct SwiftBridgeTests {
         let feed = { (event: NSEvent) in
             _ = holdSession.handleEvent(event, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
         }
-        let wait = { (seconds: TimeInterval) in RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
-        // Timers can only fire late on a busy machine, so these checks never depend on one firing on time.
-        let waitForStart = { (count: Int) -> TimeInterval in
-            let began = Date()
-            while holdStarts < count, Date().timeIntervalSince(began) < 5 { wait(0.005) }
-            return Date().timeIntervalSince(began)
-        }
+        // Capture starts on key-down with no delay.
         feed(command(true))
-        precondition(holdStarts == 0, "no start before the hold threshold")
-        let held = waitForStart(1)
-        precondition(holdStarts == 1 && held >= 0.21, "a 0.22 s hold starts dictation, and not earlier"); feed(command(false))
-        feed(command(true)); feed(keyC); wait(0.32); precondition(holdStarts == 1, "right-Command-C cancels the pending hold"); feed(command(false))
-        feed(command(true)); feed(command(false)); wait(0.32); precondition(holdStarts == 1, "a quick tap does nothing")
-        feed(command(true)); holdSession.handleDeactivate(); wait(0.32); precondition(holdStarts == 1, "without the global key, deactivation cancels as before"); feed(command(false))
+        precondition(holdStarts == 1 && holdSession.isCapturing, "pressing the voice key starts at once")
+        feed(command(true))
+        precondition(holdStarts == 1, "a repeated key-down does not start twice")
+        feed(command(false))
+        precondition(holdFinishes == 1 && !holdSession.isCapturing, "release finishes the dictation")
+        // A shortcut is dropped immediately and still reaches the app.
+        feed(command(true))
+        let chordConsumed = holdSession.handleEvent(keyC, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        precondition(!chordConsumed, "right-Command-C still reaches the app")
+        precondition(!holdSession.isCapturing, "a shortcut cancels at once")
+        feed(command(false))
+        precondition(holdStarts == 2 && holdFinishes == 1, "a cancelled shortcut never finishes into a transcription")
+        // Adding another modifier is a shortcut too.
+        let leftShift: NSEvent = {
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x38, keyDown: true)!
+            e.type = .flagsChanged
+            e.flags = [.maskCommand, .maskShift]
+            return NSEvent(cgEvent: e)!
+        }()
+        feed(command(true)); feed(leftShift)
+        precondition(!holdSession.isCapturing, "another modifier cancels at once")
+        feed(command(false))
+        precondition(holdStarts == 3 && holdFinishes == 1, "the release after a cancel does nothing")
+        // Without the global key, leaving the app cancels; with it, the dictation continues.
+        feed(command(true)); holdSession.handleDeactivate()
+        precondition(!holdSession.isCapturing, "without the global key, deactivation cancels as before"); feed(command(false))
         VoiceGlobalHotkeyController.testingForceListening = true
         precondition(VoiceGlobalHotkeyController.isListening)
-        feed(command(true)); holdSession.handleDeactivate(); _ = waitForStart(2); precondition(holdStarts == 2, "with the global key, switching app does not cancel"); feed(command(false))
+        feed(command(true)); holdSession.handleDeactivate()
+        precondition(holdSession.isCapturing, "with the global key, switching app does not cancel"); feed(command(false))
+        precondition(holdStarts == 5 && holdFinishes == 2, "one press is exactly one dictation")
         VoiceGlobalHotkeyController.testingForceListening = false
         holdSession.startRecordingOverride = nil
+        holdSession.finishRecordingOverride = nil
         VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)
         precondition(!VoiceSessionController.isLoaded && !VoiceGlobalHotkeyController.isLoaded, "turning voice off releases the listener")
 

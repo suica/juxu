@@ -39,8 +39,16 @@ public final class VoiceSessionController {
     }
 
     private var phase: Phase = .idle
-    private var holdTimer: DispatchWorkItem?
-    private var pendingHoldKeyCode: UInt16?
+    /// The model is only woken once the key has clearly been held, so taps and shortcuts stay free.
+    private static let engineWarmDelay: TimeInterval = 0.3
+    /// A press shorter than this with no speech in it is a tap: it ends silently.
+    private static let tapWindow: TimeInterval = 0.6
+    private var engineWarmItem: DispatchWorkItem?
+    private var engineWarmed = false
+    private var warmHold: (any VoiceASREngine)?
+    private var pressTime: Date?
+    /// The key went down again while a cancelled microphone start was still unwinding.
+    private var pendingRestart: (() -> Void)?
     private var levelTimer: Timer?
     private var recordingStartTime: Date?
     private var latestLevel: Float = 0
@@ -50,7 +58,6 @@ public final class VoiceSessionController {
     private var timeline = VoiceSessionTimeline()
     /// The microphone is starting off the main thread; a release or Esc can arrive meanwhile.
     private var isStarting = false
-    private var stopRequestedWhileStarting = false
     private var startAborted = false
     private var activeRecorder: VoiceAudioRecorder?
     private var activeStream: VoiceWhisperStreamSession?
@@ -70,12 +77,18 @@ public final class VoiceSessionController {
 
     public var isRecording: Bool { phase == .recording }
 
+    /// The voice key is down and audio is being captured, or the microphone is coming up for it.
+    public var isCapturing: Bool { phase == .recording || (isStarting && !startAborted) }
+
     /// Test seam: replaces starting the microphone.
     var startRecordingOverride: (() -> Void)?
+    /// Test seam: called instead of transcribing when the key is released.
+    var finishRecordingOverride: (() -> Void)?
 
+    /// Another key joined the voice key, so this was a shortcut: drop everything without a notice.
     public func cancelForChord() {
-        cancelPendingHold()
-        if phase == .recording || isStarting { cancelCurrentSession(showNotice: false) }
+        pendingRestart = nil
+        if isCapturing { cancelCurrentSession(showNotice: false) }
     }
 
     public func showExternalNotice(_ message: String) {
@@ -97,7 +110,7 @@ public final class VoiceSessionController {
             return false
         }
 
-        if event.type == .keyDown && event.keyCode == 0x35 && (phase != .idle || isStarting) {
+        if event.type == .keyDown && event.keyCode == 0x35 && (phase != .idle || isCapturing) {
             cancelCurrentSession(showNotice: true)
             return true
         }
@@ -111,6 +124,7 @@ public final class VoiceSessionController {
                             caretRect: caretRectProvider(),
                             windowLevel: windowLevel,
                             context: contextProvider(),
+                            warmDelay: 0,
                             onCommit: onCommit
                         )
                     } else if phase == .recording {
@@ -129,10 +143,9 @@ public final class VoiceSessionController {
         guard let targetKeyCode = prefs.triggerKey.modifierKeyCode else { return false }
 
         if event.type == .keyDown {
-            if pendingHoldKeyCode != nil {
-                cancelPendingHold()
-            }
-            return phase == .recording
+            // Never consumed: the shortcut still has to reach the app.
+            cancelForChord()
+            return false
         }
 
         guard event.type == .flagsChanged else { return false }
@@ -149,28 +162,31 @@ public final class VoiceSessionController {
         if event.keyCode == targetKeyCode {
             let isDown = flags.contains(targetFlag) && flags.subtracting([targetFlag, .capsLock]).isEmpty
             if isDown {
-                if phase == .idle && pendingHoldKeyCode == nil && !isStarting {
-                    pendingHoldKeyCode = targetKeyCode
-                    timeline.begin()
-                    let item = DispatchWorkItem { [weak self] in
-                        guard let self, self.pendingHoldKeyCode == targetKeyCode, self.phase == .idle else { return }
-                        self.pendingHoldKeyCode = nil
-                        self.timeline.mark(.holdFired)
+                if phase == .idle {
+                    let begin = { [weak self] in
+                        guard let self else { return }
+                        self.timeline.begin()
+                        self.pressTime = Date()
                         self.startRecording(
                             caretRect: caretRectProvider(),
                             windowLevel: windowLevel,
                             context: contextProvider(),
+                            warmDelay: Self.engineWarmDelay,
                             onCommit: onCommit
                         )
                     }
-                    holdTimer = item
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: item)
+                    if !isStarting {
+                        begin()
+                    } else if startAborted {
+                        pendingRestart = begin
+                    }
                 }
                 return false
             } else {
-                cancelPendingHold()
+                pendingRestart = nil
                 if isStarting {
-                    stopRequestedWhileStarting = true
+                    // Released before the microphone came up, so no audio exists to transcribe.
+                    if !startAborted { cancelCurrentSession(showNotice: false) }
                     return true
                 }
                 if phase == .recording {
@@ -179,8 +195,8 @@ public final class VoiceSessionController {
                 }
                 return false
             }
-        } else if pendingHoldKeyCode != nil {
-            cancelPendingHold()
+        } else if !flags.subtracting([targetFlag, .capsLock]).isEmpty {
+            cancelForChord()
         }
 
         return false
@@ -189,7 +205,7 @@ public final class VoiceSessionController {
     public func handleDeactivate() {
         // With the global key, switching app or input method does not end a dictation.
         if VoiceGlobalHotkeyController.isListening { return }
-        cancelPendingHold()
+        pendingRestart = nil
         if phase == .recording || isStarting {
             cancelCurrentSession(showNotice: false)
         }
@@ -283,10 +299,41 @@ public final class VoiceSessionController {
 
     // MARK: - Private Lifecycle
 
-    private func cancelPendingHold() {
-        holdTimer?.cancel()
-        holdTimer = nil
-        pendingHoldKeyCode = nil
+    private func cancelEngineWarm() {
+        engineWarmItem?.cancel()
+        engineWarmItem = nil
+        engineWarmed = false
+        releaseWarmHold()
+    }
+
+    private func releaseWarmHold() {
+        warmHold?.endSession()
+        warmHold = nil
+    }
+
+    private func warmEngine(prefs: VoicePreferences, vocabulary: [String]) {
+        engineWarmItem = nil
+        guard isCapturing, prefs.providerMode == .local else { return }
+        timeline.mark(.holdFired)
+        engineWarmed = true
+        guard let engine = VoiceASRRegistry.engine(for: prefs, vocabulary: vocabulary) else { return }
+        if phase == .recording, let recorder = activeRecorder {
+            startEngineStreamIfAvailable(prefs: prefs, recorder: recorder)
+        } else {
+            engine.beginSession()
+            warmHold = engine
+        }
+        Task { @MainActor [weak self] in
+            try? await engine.prepare()
+            self?.timeline.mark(.engineReady)
+        }
+    }
+
+    /// A cancelled start has finished unwinding; honour a press that arrived meanwhile.
+    private func runPendingRestart() {
+        let restart = pendingRestart
+        pendingRestart = nil
+        restart?()
     }
 
     private func ensurePipelineClient() -> VoicePipelineClient {
@@ -302,9 +349,11 @@ public final class VoiceSessionController {
         caretRect: NSRect,
         windowLevel: CGWindowLevel?,
         context: VoiceContext,
+        warmDelay: TimeInterval,
         onCommit: @escaping (_ text: String, _ replaceSelection: Bool) -> Void
     ) {
         if let startRecordingOverride {
+            phase = .recording
             startRecordingOverride()
             return
         }
@@ -321,32 +370,36 @@ public final class VoiceSessionController {
         latestTentativeCount = 0
 
         isStarting = true
-        stopRequestedWhileStarting = false
         startAborted = false
-        // Show the HUD and warm the model now instead of after the microphone is up.
+        // The pill and the microphone start at key-down; the model waits until the key is really held.
         VoiceHUDPanelController.shared.show(
             state: .recording(level: 0, elapsed: 0, partial: "", modeLabel: ""),
             caretRect: caretRect,
             clientWindowLevel: windowLevel
         )
         timeline.mark(.hudShown)
-        let warmEngine = prefs.providerMode == .local
-            ? VoiceASRRegistry.engine(for: prefs, vocabulary: context.personalVocabulary)
-            : nil
-        warmEngine?.beginSession()
-        if let warmEngine {
-            Task { @MainActor [weak self] in
-                try? await warmEngine.prepare()
-                self?.timeline.mark(.engineReady)
+        cancelEngineWarm()
+        let vocabulary = context.personalVocabulary
+        if warmDelay <= 0 {
+            warmEngine(prefs: prefs, vocabulary: vocabulary)
+        } else if prefs.providerMode == .local {
+            let item = DispatchWorkItem { [weak self] in
+                self?.warmEngine(prefs: prefs, vocabulary: vocabulary)
             }
+            engineWarmItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + warmDelay, execute: item)
         }
 
         Task { @MainActor [weak self] in
-            defer { warmEngine?.endSession() }
             guard let self else { return }
             let failStart = { (message: String) in
                 self.isStarting = false
-                self.showNotice(message, isError: true)
+                self.cancelEngineWarm()
+                if self.startAborted {
+                    self.runPendingRestart()
+                } else {
+                    self.showNotice(message, isError: true)
+                }
             }
             let micGranted = await Self.requestMicrophoneAccess()
             guard micGranted else {
@@ -387,18 +440,19 @@ public final class VoiceSessionController {
                 self.isStarting = false
                 if self.startAborted {
                     recorder.cancel()
+                    self.runPendingRestart()
                     return
                 }
                 self.activeRecorder = recorder
                 self.phase = .recording
                 self.recordingStartTime = Date()
                 self.sessionGeneration &+= 1
-                self.startEngineStreamIfAvailable(prefs: prefs, recorder: recorder)
+                if self.engineWarmed {
+                    self.startEngineStreamIfAvailable(prefs: prefs, recorder: recorder)
+                    self.releaseWarmHold()
+                }
                 self.startHUDTimer()
                 self.refreshRecordingHUD()
-                if self.stopRequestedWhileStarting {
-                    self.finishRecordingAndProcess()
-                }
             } catch {
                 recorder.cancel()
                 failStart(error.localizedDescription)
@@ -433,7 +487,16 @@ public final class VoiceSessionController {
     }
 
     private func finishRecordingAndProcess() {
-        guard phase == .recording, let recorder = activeRecorder else { return }
+        guard phase == .recording else { return }
+        let isShortPress = pressTime.map { Date().timeIntervalSince($0) < Self.tapWindow } ?? false
+        pressTime = nil
+        if let finishRecordingOverride {
+            phase = .idle
+            finishRecordingOverride()
+            return
+        }
+        guard let recorder = activeRecorder else { return }
+        cancelEngineWarm()
         stopHUDTimer()
         timeline.mark(.release)
         let stream = activeStream
@@ -453,7 +516,7 @@ public final class VoiceSessionController {
         let replaceSelection = prefs.speakToEditSelection
             && !(context.selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
-        if elapsed < 0.25 && samples.count < 3200 && latestPartial.isEmpty {
+        if !isShortPress && elapsed < 0.25 && samples.count < 3200 && latestPartial.isEmpty {
             stream?.cancel()
             recorder.cancel()
             activeRecorder = nil
@@ -462,11 +525,16 @@ public final class VoiceSessionController {
             return
         }
 
-        VoiceHUDPanelController.shared.show(
-            state: .transcribing(modeLabel: modeLabel),
-            caretRect: activeCaretRect,
-            clientWindowLevel: activeWindowLevel
-        )
+        let showTranscribing = { [weak self] in
+            guard let self else { return }
+            VoiceHUDPanelController.shared.show(
+                state: .transcribing(modeLabel: modeLabel),
+                caretRect: self.activeCaretRect,
+                clientWindowLevel: self.activeWindowLevel
+            )
+        }
+        // A tap must not flash the spinner, so it is only shown once speech is confirmed.
+        if !isShortPress { showTranscribing() }
 
         let client = ensurePipelineClient()
         let asrKey = VoiceKeychainStore.read(prefs.effectiveCloudASRKeyAccount)
@@ -483,6 +551,18 @@ public final class VoiceSessionController {
                     self.activeTask = nil
                     self.phase = .idle
                 }
+            }
+
+            if isShortPress {
+                let speech = await Task.detached(priority: .userInitiated) {
+                    VoiceSpeechGate.finalAudio(samples)
+                }.value
+                guard !Task.isCancelled, speech != nil else {
+                    recorder.cancel()
+                    VoiceHUDPanelController.shared.hide()
+                    return
+                }
+                showTranscribing()
             }
 
             do {
@@ -573,6 +653,8 @@ public final class VoiceSessionController {
             } catch is CancellationError {
                 VoiceHUDPanelController.shared.hide()
             } catch VoiceEngineError.cancelled {
+                VoiceHUDPanelController.shared.hide()
+            } catch VoiceEngineError.noSpeechDetected where isShortPress {
                 VoiceHUDPanelController.shared.hide()
             } catch VoiceEngineError.noSpeechDetected {
                 self.showNotice(VoiceEngineError.noSpeechDetected.localizedDescription, isError: false, duration: 1.4)
@@ -675,7 +757,8 @@ public final class VoiceSessionController {
     }
 
     private func cancelCurrentSession(showNotice: Bool) {
-        cancelPendingHold()
+        cancelEngineWarm()
+        pressTime = nil
         stopHUDTimer()
         if isStarting { startAborted = true }
         sessionGeneration &+= 1
@@ -694,7 +777,9 @@ public final class VoiceSessionController {
     }
 
     private func teardown() {
-        cancelPendingHold()
+        cancelEngineWarm()
+        pendingRestart = nil
+        pressTime = nil
         stopHUDTimer()
         if isStarting { startAborted = true }
         sessionGeneration &+= 1
