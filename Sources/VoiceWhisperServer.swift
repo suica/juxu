@@ -1,3 +1,4 @@
+import Accelerate
 import Darwin
 import Foundation
 
@@ -66,62 +67,112 @@ public enum VoiceWhisperStreamPolicy {
 
 // MARK: - Speech Gate
 
-/// Decides from the audio alone whether anyone spoke. Whisper cannot be asked: on this model
-/// `no_speech_prob` stays near 1e-10 even for digital silence, which it transcribes confidently.
+/// Decides from the audio alone whether anyone spoke. Whisper cannot be asked: it transcribes
+/// silence confidently, and its `no_speech_prob` stays near 1e-10 even then.
+///
+/// A frame counts as voiced when it is periodic in the human pitch range, which does not depend on
+/// microphone level, and stands above the clip's own noise floor. Thresholds were chosen on half of
+/// a real-speech corpus (near-field, spontaneous and far-field meetings) and checked on the other.
 public enum VoiceSpeechGate {
-    static let frameSamples = 320 // 20 ms
-    static let minSpeechRMS = 250.0
-    static let minDynamicRange = 2.2
-    static let maxGapFrames = 8
-    static let minVoicedFrames = 8
-    static let minRunDensity = 0.45
+    static let hopSamples = 320 // 20 ms
+    static let windowSamples = 640 // 40 ms
+    static let minLag = 40 // 400 Hz
+    static let maxLag = 228 // 70 Hz
+    static let voicingThreshold: Float = 0.40
+    static let minLevel: Float = 60
+    static let noiseFloorRatio: Float = 2.0
+    static let maxGapFrames = 10
+    static let minRunDensity = 0.5
+    /// A long voiced run is speech at any level, so quiet far-field talkers are kept.
+    static let longRunFrames = 20
+    /// A short run, such as one spoken word, must also be clearly louder than background murmur.
+    static let shortRunFrames = 10
+    static let shortRunLevel: Float = 120
 
-    /// Per-frame flags, true only inside runs that look like speech. Steady noise has too little
-    /// dynamic range; key clicks are too short and too sparse to form a run.
-    public static func voicedFrames(_ samples: [Int16]) -> [Bool] {
-        let count = samples.count / frameSamples
-        guard count >= 5 else { return [] }
-        var levels = [Double](repeating: 0, count: count)
-        samples.withUnsafeBufferPointer { buf in
-            for f in 0..<count {
-                var sum = 0.0
-                for i in (f * frameSamples)..<((f + 1) * frameSamples) {
-                    let v = Double(buf[i])
-                    sum += v * v
-                }
-                levels[f] = (sum / Double(frameSamples)).squareRoot()
+    private static let hann: [Float] = (0..<windowSamples).map {
+        Float(0.5 - 0.5 * cos(2 * Double.pi * Double($0) / Double(windowSamples - 1)))
+    }
+
+    /// The window's own autocorrelation, so peaks at different lags are comparable.
+    private static let hannAutocorrelation: [Float] = {
+        var values = [Float](repeating: 0, count: maxLag + 1)
+        hann.withUnsafeBufferPointer { h in
+            for lag in 0...maxLag {
+                var sum: Float = 0
+                vDSP_dotpr(h.baseAddress!, 1, h.baseAddress! + lag, 1, &sum, vDSP_Length(windowSamples - lag))
+                values[lag] = sum
             }
         }
-        let sorted = levels.sorted()
-        let floor = sorted[count / 10]
-        let high = sorted[min(count - 1, count * 95 / 100)]
-        var flags = [Bool](repeating: false, count: count)
-        guard high >= minSpeechRMS, high / max(floor, 1) >= minDynamicRange else { return flags }
+        let first = values[0]
+        return values.map { max($0 / first, 1e-6) }
+    }()
 
-        let threshold = max(minSpeechRMS * 0.8, floor * 2)
-        var f = 0
-        while f < count {
-            guard levels[f] >= threshold else {
-                f += 1
-                continue
-            }
-            var last = f
-            var voiced = 1
-            var next = f + 1
-            while next < count, next - last <= maxGapFrames + 1 {
-                if levels[next] >= threshold {
-                    last = next
-                    voiced += 1
+    private static func frameFeatures(_ samples: [Int16]) -> (levels: [Float], voicing: [Float]) {
+        guard samples.count >= windowSamples else { return ([], []) }
+        let count = (samples.count - windowSamples) / hopSamples + 1
+        var levels = [Float](repeating: 0, count: count)
+        var voicing = [Float](repeating: 0, count: count)
+        var raw = [Float](repeating: 0, count: windowSamples)
+        var x = [Float](repeating: 0, count: windowSamples)
+        let n = vDSP_Length(windowSamples)
+        for frame in 0..<count {
+            let start = frame * hopSamples
+            for i in 0..<windowSamples { raw[i] = Float(samples[start + i]) }
+            var power: Float = 0
+            vDSP_svesq(raw, 1, &power, n)
+            levels[frame] = (power / Float(windowSamples)).squareRoot()
+            var mean: Float = 0
+            vDSP_meanv(raw, 1, &mean, n)
+            for i in 0..<windowSamples { x[i] = (raw[i] - mean) * hann[i] }
+            var energy: Float = 0
+            vDSP_svesq(x, 1, &energy, n)
+            guard energy > 0 else { continue }
+            var best: Float = 0
+            x.withUnsafeBufferPointer { p in
+                for lag in minLag...maxLag {
+                    var r: Float = 0
+                    vDSP_dotpr(p.baseAddress!, 1, p.baseAddress! + lag, 1, &r, vDSP_Length(windowSamples - lag))
+                    best = max(best, (r / energy) / hannAutocorrelation[lag])
                 }
-                next += 1
             }
-            let length = last - f + 1
-            if voiced >= minVoicedFrames, Double(voiced) / Double(length) >= minRunDensity {
-                for i in f...last where levels[i] >= threshold {
-                    flags[i] = true
+            voicing[frame] = min(best, 1.2)
+        }
+        return (levels, voicing)
+    }
+
+    /// Per-frame flags, true only inside runs that look like speech.
+    public static func voicedFrames(_ samples: [Int16]) -> [Bool] {
+        let (levels, voicing) = frameFeatures(samples)
+        guard !levels.isEmpty else { return [] }
+        var flags = [Bool](repeating: false, count: levels.count)
+        let sorted = levels.sorted()
+        let position = Float(sorted.count - 1) * 0.1
+        let lower = Int(position)
+        let upper = min(lower + 1, sorted.count - 1)
+        let floor = sorted[lower] + (sorted[upper] - sorted[lower]) * (position - Float(lower))
+        let threshold = max(minLevel, floor * noiseFloorRatio)
+        let voiced = levels.indices.filter { voicing[$0] >= voicingThreshold && levels[$0] >= threshold }
+        guard voiced.count >= shortRunFrames else { return flags }
+
+        var runStart = 0
+        for i in 0..<voiced.count {
+            let endsRun = i == voiced.count - 1 || voiced[i + 1] - voiced[i] > maxGapFrames + 1
+            guard endsRun else { continue }
+            let run = voiced[runStart...i]
+            let span = voiced[i] - voiced[runStart] + 1
+            if Double(run.count) / Double(span) >= minRunDensity {
+                var isSpeech = run.count >= longRunFrames
+                if !isSpeech, run.count >= shortRunFrames {
+                    let runLevels = run.map { levels[$0] }.sorted()
+                    let middle = runLevels.count / 2
+                    let median = runLevels.count % 2 == 0
+                        ? (runLevels[middle - 1] + runLevels[middle]) / 2
+                        : runLevels[middle]
+                    isSpeech = median >= shortRunLevel
                 }
+                if isSpeech { run.forEach { flags[$0] = true } }
             }
-            f = last + 1
+            runStart = i + 1
         }
         return flags
     }
@@ -130,9 +181,9 @@ public enum VoiceSpeechGate {
         let flags = voicedFrames(samples)
         guard let first = flags.firstIndex(of: true), let last = flags.lastIndex(of: true) else { return nil }
         let rate = Double(VoiceWhisperStreamPolicy.sampleRate)
-        let start = max(0, first * frameSamples - Int(leadSeconds * rate))
-        let end = min(samples.count, (last + 1) * frameSamples + Int(tailSeconds * rate))
-        let voiced = Double(flags.lazy.filter { $0 }.count) * Double(frameSamples) / rate
+        let start = max(0, first * hopSamples - Int(leadSeconds * rate))
+        let end = min(samples.count, last * hopSamples + windowSamples + Int(tailSeconds * rate))
+        let voiced = Double(flags.lazy.filter { $0 }.count) * Double(hopSamples) / rate
         return (Array(samples[start..<end]), voiced)
     }
 
@@ -143,14 +194,16 @@ public enum VoiceSpeechGate {
         return slice.audio
     }
 
-    /// All speech in the recording with generous padding, or nil when nobody spoke.
+    /// The whole recording, or nil when nobody spoke. It is never trimmed: quiet far-field words
+    /// can sit outside the voiced frames, and cutting them made finals lose real speech.
     public static func finalAudio(_ samples: [Int16]) -> (audio: [Int16], voicedSeconds: Double)? {
-        speechSlice(samples, leadSeconds: 0.3, tailSeconds: 0.5)
+        let voiced = voicedSeconds(samples)
+        return voiced > 0 ? (samples, voiced) : nil
     }
 
     static func voicedSeconds(_ samples: [Int16]) -> Double {
         let voiced = voicedFrames(samples).lazy.filter { $0 }.count
-        return Double(voiced) * Double(frameSamples) / Double(VoiceWhisperStreamPolicy.sampleRate)
+        return Double(voiced) * Double(hopSamples) / Double(VoiceWhisperStreamPolicy.sampleRate)
     }
 }
 
@@ -631,7 +684,12 @@ public final class VoiceWhisperStreamSession {
         while !Task.isCancelled, state == .streaming {
             let passStart = Date()
             let (window, total) = sampleProvider(VoiceWhisperStreamPolicy.partialWindowSamples)
-            if total > lastTotal, let voiced = VoiceSpeechGate.partialAudio(window) {
+            // The gate is CPU work, so it stays off the main thread that handles typing.
+            let gated = total > lastTotal
+                ? await Task.detached(priority: .userInitiated) { VoiceSpeechGate.partialAudio(window) }.value
+                : nil
+            guard !Task.isCancelled, state == .streaming else { return }
+            if let voiced = gated {
                 lastTotal = total
                 let wav = VoiceWAVEncoder.encodePCM16Mono(samples: voiced, sampleRate: VoiceWhisperStreamPolicy.sampleRate)
                 do {

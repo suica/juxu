@@ -420,7 +420,11 @@ public final class VoiceSessionController {
                     var audio = samples
                     var voicedSeconds = 0.0
                     if isLocalWhisper {
-                        guard let speech = VoiceSpeechGate.finalAudio(samples) else {
+                        let gated = await Task.detached(priority: .userInitiated) {
+                            VoiceSpeechGate.finalAudio(samples)
+                        }.value
+                        try Task.checkCancellation()
+                        guard let speech = gated else {
                             throw VoiceEngineError.noSpeechDetected
                         }
                         audio = speech.audio

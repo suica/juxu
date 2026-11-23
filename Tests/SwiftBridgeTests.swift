@@ -279,9 +279,13 @@ struct SwiftBridgeTests {
         var clicks = [Int16](repeating: 5, count: 48_000)
         for c in 0..<9 { for j in 0..<160 { clicks[3_000 + c * 5_000 + j] = 9_000 } }
         precondition(VoiceSpeechGate.finalAudio(clicks) == nil, "isolated key clicks are not speech")
-        var burst = [Int16](repeating: 5, count: 48_000)
-        for i in 16_000..<24_000 { burst[i] = i % 2 == 0 ? 3_000 : -3_000 }
-        precondition(VoiceSpeechGate.finalAudio(burst)?.audio.count == 8_000 + 4_800 + 8_000, "speech is kept with padding")
+        // A periodic 150 Hz signal with a syllable envelope is the shape the gate looks for.
+        var voiced = [Int16](repeating: 0, count: 48_000)
+        for i in 16_000..<32_000 {
+            let envelope = 0.6 + 0.4 * sin(2 * Double.pi * 4 * Double(i) / 16_000)
+            voiced[i] = Int16(3_000 * envelope * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        precondition(VoiceSpeechGate.finalAudio(voiced)?.audio.count == voiced.count, "speech is kept and the final is never trimmed")
         precondition(VoiceHallucinationFilter.shouldDrop("请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", voicedSeconds: 0.3))
         precondition(VoiceHallucinationFilter.shouldDrop("字幕志愿者 杨栋梁", voicedSeconds: 0))
         precondition(!VoiceHallucinationFilter.shouldDrop("请大家点赞订阅转发", voicedSeconds: 1.6), "a person really saying it keeps it")
