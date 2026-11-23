@@ -480,6 +480,7 @@ struct SwiftBridgeTests {
         var holdFinishes = 0
         holdSession.startRecordingOverride = { holdStarts += 1 }
         holdSession.finishRecordingOverride = { holdFinishes += 1 }
+        holdSession.doubleTapWindow = 0
         let command = { (down: Bool) -> NSEvent in
             let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x36, keyDown: down)!
             e.type = .flagsChanged
@@ -528,6 +529,55 @@ struct SwiftBridgeTests {
         precondition(holdSession.isCapturing, "with the global key, switching app does not cancel"); feed(command(false))
         precondition(holdStarts == 5 && holdFinishes == 2, "one press is exactly one dictation")
         VoiceGlobalHotkeyController.testingForceListening = false
+
+        // Double-tap hands-free: a tap waits briefly, a second tap latches, the next press ends.
+        var cues: [VoiceCueKind] = []
+        holdSession.cueOverride = { cues.append($0) }
+        holdSession.doubleTapWindow = 0.3
+        let escapeKey: NSEvent = NSEvent(cgEvent: CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: true)!)!
+        var finishesBefore = holdFinishes
+        feed(command(true)); feed(command(false))
+        precondition(holdSession.isCapturing && holdFinishes == finishesBefore, "a tap waits for a possible second tap")
+        holdSession.fireTapTimeoutForTesting()
+        precondition(!holdSession.isCapturing && holdFinishes == finishesBefore + 1, "a lone tap ends after the window")
+        precondition(cues.isEmpty, "a lone tap is silent")
+        finishesBefore = holdFinishes
+        feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false))
+        precondition(holdSession.isHandsFree && holdSession.isCapturing, "a double tap latches")
+        precondition(cues == [.start], "latching plays the start cue once")
+        holdSession.cancelForChord()
+        precondition(holdSession.isCapturing, "typing does not end a hands-free dictation")
+        feed(command(true))
+        precondition(!holdSession.isCapturing && !holdSession.isHandsFree && holdFinishes == finishesBefore + 1, "the next press ends it")
+        precondition(cues == [.start, .end], "ending plays the end cue")
+        feed(command(false))
+        precondition(holdFinishes == finishesBefore + 1, "the release after ending does nothing")
+        cues = []
+        feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false))
+        precondition(holdSession.isHandsFree)
+        _ = holdSession.handleEvent(escapeKey, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        precondition(!holdSession.isCapturing && !holdSession.isHandsFree && holdFinishes == finishesBefore + 1, "Esc cancels without transcribing")
+        precondition(cues == [.start], "cancelling plays no end cue")
+        cues = []
+        feed(command(true)); feed(command(false)); feed(command(true))
+        _ = holdSession.handleEvent(keyC, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        precondition(!holdSession.isCapturing && !holdSession.isHandsFree, "a shortcut on the second press cancels")
+        feed(command(false))
+        precondition(holdFinishes == finishesBefore + 1 && cues.isEmpty, "a cancelled double tap stays silent")
+        VoicePreferencesStore.shared.update({ $0.voiceCues = false }, persist: false)
+        feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false))
+        precondition(cues.isEmpty, "the setting turns cues off")
+        VoicePreferencesStore.shared.update({ $0.voiceCues = nil }, persist: false)
+        holdSession.cueOverride = nil
+        holdSession.doubleTapWindow = 0
+
+        // Cues: the blanked range covers only the audible time, and tones stay short and in range.
+        precondition(VoiceCueMute.sampleRange(bufferStart: 10, count: 1600, sampleRate: 16_000, muteStart: 10.05, muteEnd: 10.06) == 800..<960, "only the cue is blanked")
+        precondition(VoiceCueMute.sampleRange(bufferStart: 10, count: 1600, sampleRate: 16_000, muteStart: 9, muteEnd: 9.5).isEmpty, "audio after the cue is kept")
+        precondition(VoiceCueMute.sampleRange(bufferStart: 10, count: 1600, sampleRate: 16_000, muteStart: 9.9, muteEnd: 11) == 0..<1600, "a buffer inside the cue is blanked whole")
+        let tone = VoiceCuePlayer.toneSamples(fromHz: 660, toHz: 880)
+        precondition(tone.count == 3087 && abs(Int(tone.last!)) < 200, "the tone is short and fades out")
+
         holdSession.startRecordingOverride = nil
         holdSession.finishRecordingOverride = nil
         VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)

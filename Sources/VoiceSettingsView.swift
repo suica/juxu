@@ -353,6 +353,26 @@ public struct VoiceSettingsView: View {
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
+                        Text("开始和结束提示音")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("双击语音键可免按住长录，再按一下结束，Esc 取消")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { voiceStore.prefs.areVoiceCuesEnabled },
+                        set: { isOn in voiceStore.update { $0.voiceCues = isOn ? nil : false } }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
+
+                Divider()
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text("输出模式与语气")
                             .font(.system(size: 13, weight: .medium))
                         Text("智能整理会自动去口水词、修正口误，并按聊天/IDE/邮件切换风格")

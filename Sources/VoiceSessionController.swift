@@ -47,6 +47,20 @@ public final class VoiceSessionController {
     private var engineWarmed = false
     private var warmHold: (any VoiceASREngine)?
     private var pressTime: Date?
+    /// A quick tap waits this long for a second press before it counts as a plain tap.
+    var doubleTapWindow: TimeInterval = 0.3
+    private static let secondPressHoldLimit: TimeInterval = 0.3
+    private static let holdCueDelay: TimeInterval = 0.3
+    /// Below this display level nobody is talking yet, so a cue cannot land on speech.
+    private static let cueQuietLevel: Float = 0.08
+    private var tapTimeoutItem: DispatchWorkItem?
+    private var secondPressTime: Date?
+    private var handsFree = false
+    private var holdCueItem: DispatchWorkItem?
+    private var startCueDue = false
+    private var cueSounded = false
+    /// Test seam: replaces playing a cue.
+    var cueOverride: ((VoiceCueKind) -> Void)?
     /// The key went down again while a cancelled microphone start was still unwinding.
     private var pendingRestart: (() -> Void)?
     private var levelTimer: Timer?
@@ -88,9 +102,24 @@ public final class VoiceSessionController {
 
     /// Another key joined the voice key, so this was a shortcut: drop everything without a notice.
     public func cancelForChord() {
+        // Typing during a hands-free dictation is not a shortcut on the voice key.
+        if handsFree { return }
         pendingRestart = nil
         if isCapturing { cancelCurrentSession(showNotice: false) }
     }
+
+    /// The global listener stopped, so the key that would end a hands-free dictation is gone.
+    public func cancelForLostListener() {
+        handsFree = false
+        cancelForChord()
+    }
+
+    /// Test seam: the double-tap window has passed.
+    func fireTapTimeoutForTesting() {
+        tapTimeoutItem?.perform()
+    }
+
+    public var isHandsFree: Bool { handsFree }
 
     public func showExternalNotice(_ message: String) {
         showNotice(message, isError: false, duration: 3.2)
@@ -163,11 +192,27 @@ public final class VoiceSessionController {
         if event.keyCode == targetKeyCode {
             let isDown = flags.contains(targetFlag) && flags.subtracting([targetFlag, .capsLock]).isEmpty
             if isDown {
+                if handsFree {
+                    if isStarting {
+                        cancelCurrentSession(showNotice: false)
+                    } else {
+                        finishRecordingAndProcess()
+                    }
+                    return true
+                }
+                if tapTimeoutItem != nil {
+                    tapTimeoutItem?.cancel()
+                    tapTimeoutItem = nil
+                    secondPressTime = Date()
+                    scheduleHoldCue()
+                    return false
+                }
                 if phase == .idle {
                     let begin = { [weak self] in
                         guard let self else { return }
                         self.timeline.begin()
                         self.pressTime = Date()
+                        self.scheduleHoldCue()
                         self.startRecording(
                             caretRect: caretRectProvider(),
                             windowLevel: windowLevel,
@@ -185,6 +230,36 @@ public final class VoiceSessionController {
                 return false
             } else {
                 pendingRestart = nil
+                if handsFree { return false }
+                if let second = secondPressTime {
+                    secondPressTime = nil
+                    if isCapturing, Date().timeIntervalSince(second) < Self.secondPressHoldLimit {
+                        handsFree = true
+                        pressTime = nil
+                        holdCueItem?.cancel()
+                        holdCueItem = nil
+                        playStartCue()
+                        return true
+                    }
+                    // The second press was held, so it is an ordinary dictation.
+                    pressTime = nil
+                } else if doubleTapWindow > 0, isCapturing, let pressed = pressTime,
+                          Date().timeIntervalSince(pressed) < doubleTapWindow {
+                    holdCueItem?.cancel()
+                    holdCueItem = nil
+                    let item = DispatchWorkItem { [weak self] in
+                        guard let self else { return }
+                        self.tapTimeoutItem = nil
+                        if self.isStarting {
+                            if !self.startAborted { self.cancelCurrentSession(showNotice: false) }
+                        } else {
+                            self.finishRecordingAndProcess()
+                        }
+                    }
+                    tapTimeoutItem = item
+                    DispatchQueue.main.asyncAfter(deadline: .now() + doubleTapWindow, execute: item)
+                    return true
+                }
                 if isStarting {
                     // Released before the microphone came up, so no audio exists to transcribe.
                     if !startAborted { cancelCurrentSession(showNotice: false) }
@@ -300,6 +375,49 @@ public final class VoiceSessionController {
 
     // MARK: - Private Lifecycle
 
+    private func resetPressState() {
+        tapTimeoutItem?.cancel()
+        tapTimeoutItem = nil
+        holdCueItem?.cancel()
+        holdCueItem = nil
+        secondPressTime = nil
+        handsFree = false
+        startCueDue = false
+    }
+
+    /// The cue waits until the key is clearly held, so shortcuts on the voice key stay silent.
+    private func scheduleHoldCue() {
+        holdCueItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.holdCueItem = nil
+            if self.isCapturing { self.playStartCue() }
+        }
+        holdCueItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.holdCueDelay, execute: item)
+    }
+
+    private func playStartCue() {
+        guard VoicePreferencesStore.shared.prefs.areVoiceCuesEnabled, !cueSounded else { return }
+        guard phase == .recording else {
+            startCueDue = true
+            return
+        }
+        cueSounded = true
+        // Already talking: stay silent rather than put a sound on top of the first words.
+        guard max(latestLevel, peakLevelSinceDraw ?? 0) < Self.cueQuietLevel else { return }
+        activeRecorder?.muteInput(forSeconds: VoiceCuePlayer.audibleSeconds)
+        playCue(.start)
+    }
+
+    private func playCue(_ kind: VoiceCueKind) {
+        if let cueOverride {
+            cueOverride(kind)
+        } else {
+            VoiceCuePlayer.shared.play(kind)
+        }
+    }
+
     private func cancelEngineWarm() {
         engineWarmItem?.cancel()
         engineWarmItem = nil
@@ -369,6 +487,7 @@ public final class VoiceSessionController {
         peakLevelSinceDraw = nil
         latestPartial = ""
         latestTentativeCount = 0
+        cueSounded = false
 
         // Capture full AXUIElement context asynchronously so key-down / HUD display stays instant (0 ms added).
         activeContextCaptureTask?.cancel()
@@ -410,6 +529,7 @@ public final class VoiceSessionController {
             guard let self else { return }
             let failStart = { (message: String) in
                 self.isStarting = false
+                self.resetPressState()
                 self.cancelEngineWarm()
                 if self.startAborted {
                     self.runPendingRestart()
@@ -477,6 +597,10 @@ public final class VoiceSessionController {
                 }
                 self.startHUDTimer()
                 self.refreshRecordingHUD()
+                if self.startCueDue {
+                    self.startCueDue = false
+                    self.playStartCue()
+                }
             } catch {
                 recorder.cancel()
                 failStart(error.localizedDescription)
@@ -514,8 +638,12 @@ public final class VoiceSessionController {
         guard phase == .recording else { return }
         let isShortPress = pressTime.map { Date().timeIntervalSince($0) < Self.tapWindow } ?? false
         pressTime = nil
+        let endCue = cueSounded && VoicePreferencesStore.shared.prefs.areVoiceCuesEnabled
+        cueSounded = false
+        resetPressState()
         if let finishRecordingOverride {
             phase = .idle
+            if endCue { playCue(.end) }
             finishRecordingOverride()
             return
         }
@@ -527,6 +655,8 @@ public final class VoiceSessionController {
         activeStream = nil
         let generation = sessionGeneration
         let samples = recorder.stopAndCollectSamples()
+        // Played only after the microphone has stopped, so it cannot be captured.
+        if endCue { playCue(.end) }
         timeline.levelSummary = recorder.levelSummary()
         let elapsed = Date().timeIntervalSince(recordingStartTime ?? Date())
         phase = .processing
@@ -782,6 +912,8 @@ public final class VoiceSessionController {
     }
 
     private func cancelCurrentSession(showNotice: Bool) {
+        resetPressState()
+        cueSounded = false
         cancelEngineWarm()
         pressTime = nil
         stopHUDTimer()
@@ -804,6 +936,8 @@ public final class VoiceSessionController {
     }
 
     private func teardown() {
+        resetPressState()
+        cueSounded = false
         cancelEngineWarm()
         pendingRestart = nil
         pressTime = nil
@@ -904,5 +1038,56 @@ public final class VoiceSessionController {
         @unknown default:
             return false
         }
+    }
+}
+
+enum VoiceCueKind {
+    case start
+    case end
+}
+
+/// Two short, quiet tones generated in memory: rising to start, falling to end.
+@MainActor
+final class VoiceCuePlayer {
+    static let shared = VoiceCuePlayer()
+    /// Tone length plus output latency; the microphone is blanked for this long.
+    static let audibleSeconds: TimeInterval = 0.14
+    private static let toneSeconds = 0.07
+    private static let volume: Float = 0.14
+
+    private lazy var startSound = Self.makeSound(fromHz: 660, toHz: 880)
+    private lazy var endSound = Self.makeSound(fromHz: 880, toHz: 620)
+
+    func play(_ kind: VoiceCueKind) {
+        guard let sound = kind == .start ? startSound : endSound else { return }
+        sound.stop()
+        sound.volume = Self.volume
+        sound.play()
+    }
+
+    static func toneSamples(fromHz: Double, toHz: Double, sampleRate: Double = 44_100) -> [Int16] {
+        let count = Int(sampleRate * toneSeconds)
+        var phase = 0.0
+        return (0..<count).map { i in
+            let t = Double(i) / Double(count)
+            phase += 2 * .pi * (fromHz + (toHz - fromHz) * t) / sampleRate
+            let envelope = min(1, t / 0.08) * pow(1 - t, 2)
+            return Int16(sin(phase) * envelope * 0.8 * Double(Int16.max))
+        }
+    }
+
+    private static func makeSound(fromHz: Double, toHz: Double) -> NSSound? {
+        let samples = toneSamples(fromHz: fromHz, toHz: toHz)
+        let rate: UInt32 = 44_100
+        var wav = Data()
+        let u32 = { (v: UInt32) in withUnsafeBytes(of: v.littleEndian) { wav.append(contentsOf: $0) } }
+        let u16 = { (v: UInt16) in withUnsafeBytes(of: v.littleEndian) { wav.append(contentsOf: $0) } }
+        let byteCount = UInt32(samples.count * 2)
+        wav.append(contentsOf: Array("RIFF".utf8)); u32(36 + byteCount)
+        wav.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1)
+        u32(rate); u32(rate * 2); u16(2); u16(16)
+        wav.append(contentsOf: Array("data".utf8)); u32(byteCount)
+        for sample in samples { u16(UInt16(bitPattern: sample)) }
+        return NSSound(data: wav)
     }
 }
