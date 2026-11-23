@@ -432,14 +432,22 @@ struct SwiftBridgeTests {
             _ = holdSession.handleEvent(event, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
         }
         let wait = { (seconds: TimeInterval) in RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
-        feed(command(true)); wait(0.10); precondition(holdStarts == 0, "no start before the hold threshold"); wait(0.25)
-        precondition(holdStarts == 1, "a 0.22 s hold starts dictation"); feed(command(false))
-        feed(command(true)); wait(0.05); feed(keyC); wait(0.32); precondition(holdStarts == 1, "right-Command-C cancels the pending hold"); feed(command(false))
-        feed(command(true)); wait(0.05); feed(command(false)); wait(0.32); precondition(holdStarts == 1, "a quick tap does nothing")
-        feed(command(true)); wait(0.05); holdSession.handleDeactivate(); wait(0.32); precondition(holdStarts == 1, "without the global key, deactivation cancels as before"); feed(command(false))
+        // Timers can only fire late on a busy machine, so these checks never depend on one firing on time.
+        let waitForStart = { (count: Int) -> TimeInterval in
+            let began = Date()
+            while holdStarts < count, Date().timeIntervalSince(began) < 5 { wait(0.005) }
+            return Date().timeIntervalSince(began)
+        }
+        feed(command(true))
+        precondition(holdStarts == 0, "no start before the hold threshold")
+        let held = waitForStart(1)
+        precondition(holdStarts == 1 && held >= 0.21, "a 0.22 s hold starts dictation, and not earlier"); feed(command(false))
+        feed(command(true)); feed(keyC); wait(0.32); precondition(holdStarts == 1, "right-Command-C cancels the pending hold"); feed(command(false))
+        feed(command(true)); feed(command(false)); wait(0.32); precondition(holdStarts == 1, "a quick tap does nothing")
+        feed(command(true)); holdSession.handleDeactivate(); wait(0.32); precondition(holdStarts == 1, "without the global key, deactivation cancels as before"); feed(command(false))
         VoiceGlobalHotkeyController.testingForceListening = true
         precondition(VoiceGlobalHotkeyController.isListening)
-        feed(command(true)); wait(0.05); holdSession.handleDeactivate(); wait(0.32); precondition(holdStarts == 2, "with the global key, switching app does not cancel"); feed(command(false))
+        feed(command(true)); holdSession.handleDeactivate(); _ = waitForStart(2); precondition(holdStarts == 2, "with the global key, switching app does not cancel"); feed(command(false))
         VoiceGlobalHotkeyController.testingForceListening = false
         holdSession.startRecordingOverride = nil
         VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)
