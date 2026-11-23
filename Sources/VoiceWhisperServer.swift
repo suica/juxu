@@ -6,13 +6,9 @@ import Foundation
 
 public enum VoiceWhisperStreamPolicy {
     public static let sampleRate = 16_000
-    /// Target time between the starts of two partial passes.
-    public static let partialInterval: TimeInterval = 1.0
     /// Partials only look at this much recent audio, so their cost stays bounded.
     public static let partialWindowSeconds = 12
     public static var partialWindowSamples: Int { partialWindowSeconds * sampleRate }
-    /// Voiced audio needed before a partial pass; shorter snippets transcribe unreliably.
-    public static let minPartialVoicedSeconds = 0.5
     public static let partialRequestTimeout: TimeInterval = 8
     public static let idleTimeout: TimeInterval = 300
     public static func finalRequestTimeout(sampleCount: Int) -> TimeInterval {
@@ -78,6 +74,44 @@ public enum VoiceWhisperStreamPolicy {
         }
         return out
     }
+}
+
+// MARK: - Live Caption Cadence
+
+/// How eagerly partial passes run. A pass starts as soon as the previous one has finished and
+/// enough new audio exists, and backs off when passes are slow or the Mac is under pressure.
+public struct VoicePartialCadence: Sendable {
+    public var minInterval: TimeInterval
+    public var minVoicedSeconds: Double
+    /// Keeps the model idle for part of every cycle, so captions cannot pin the GPU.
+    public var maxDutyCycle: Double = 0.7
+
+    public static let standard = VoicePartialCadence(minInterval: 0.3, minVoicedSeconds: 0.25)
+
+    public init(minInterval: TimeInterval, minVoicedSeconds: Double) {
+        self.minInterval = minInterval
+        self.minVoicedSeconds = minVoicedSeconds
+    }
+
+    /// Time between the starts of two passes.
+    public func interval(
+        lastPass: TimeInterval,
+        thermal: ProcessInfo.ThermalState,
+        lowPower: Bool,
+        memoryPressure: Bool
+    ) -> TimeInterval {
+        var value = max(minInterval, lastPass / maxDutyCycle)
+        if lowPower { value = max(value, 0.7) }
+        if memoryPressure { value = max(value, 1.0) }
+        switch thermal {
+        case .serious: value = max(value, 1.0)
+        case .critical: value = max(value, 2.0)
+        default: break
+        }
+        return value
+    }
+
+    public var minNewSamples: Int { Int(minInterval * 0.8 * Double(VoiceWhisperStreamPolicy.sampleRate)) }
 }
 
 // MARK: - Speech Gate
@@ -203,9 +237,12 @@ public enum VoiceSpeechGate {
     }
 
     /// Audio for a partial pass, or nil until there is enough speech to be worth transcribing.
-    public static func partialAudio(_ window: [Int16]) -> [Int16]? {
+    public static func partialAudio(
+        _ window: [Int16],
+        minVoicedSeconds: Double = VoicePartialCadence.standard.minVoicedSeconds
+    ) -> [Int16]? {
         guard let slice = speechSlice(window, leadSeconds: 0.2, tailSeconds: 0.3),
-              slice.voicedSeconds >= VoiceWhisperStreamPolicy.minPartialVoicedSeconds else { return nil }
+              slice.voicedSeconds >= minVoicedSeconds else { return nil }
         return slice.audio
     }
 
@@ -616,6 +653,11 @@ public final class VoiceWhisperStreamSession {
     private let sampleProvider: SampleProvider
     private let onPartial: @MainActor (VoicePartialDisplay) -> Void
     private var stabilizer = VoicePartialStabilizer()
+    private let cadence: VoicePartialCadence
+    private var memoryPressure = false
+    private var pressureSource: DispatchSourceMemoryPressure?
+    /// Called just before each partial pass, for timing.
+    public var onPassStarted: (@MainActor () -> Void)?
     private var state: State = .idle
     private var loopTask: Task<Void, Never>?
 
@@ -623,8 +665,10 @@ public final class VoiceWhisperStreamSession {
         transcriber: VoiceASREngine,
         language: String,
         sampleProvider: @escaping SampleProvider,
+        cadence: VoicePartialCadence = .standard,
         onPartial: @escaping @MainActor (VoicePartialDisplay) -> Void
     ) {
+        self.cadence = cadence
         self.transcriber = transcriber
         self.language = language
         self.sampleProvider = sampleProvider
@@ -635,6 +679,13 @@ public final class VoiceWhisperStreamSession {
         guard state == .idle else { return }
         state = .streaming
         transcriber.beginSession()
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: .main)
+        source.setEventHandler { [weak self, weak source] in
+            guard let event = source?.data else { return }
+            MainActor.assumeIsolated { self?.memoryPressure = !event.contains(.normal) }
+        }
+        source.resume()
+        pressureSource = source
         loopTask = Task { @MainActor [weak self] in
             await self?.runPartialLoop()
         }
@@ -665,6 +716,8 @@ public final class VoiceWhisperStreamSession {
     }
 
     private func endIfNeeded() {
+        pressureSource?.cancel()
+        pressureSource = nil
         guard state == .streaming || state == .finishing else {
             state = .ended
             return
@@ -681,16 +734,23 @@ public final class VoiceWhisperStreamSession {
         }
 
         var lastTotal = 0
+        var lastPass: TimeInterval = 0
         while !Task.isCancelled, state == .streaming {
-            let passStart = Date()
+            let cycleStart = Date()
             let (window, total) = sampleProvider(VoiceWhisperStreamPolicy.partialWindowSamples)
+            let hasNewAudio = lastTotal == 0 ? total > 0 : total - lastTotal >= cadence.minNewSamples
             // The gate is CPU work, so it stays off the main thread that handles typing.
-            let gated = total > lastTotal
-                ? await Task.detached(priority: .userInitiated) { VoiceSpeechGate.partialAudio(window) }.value
+            let minVoiced = cadence.minVoicedSeconds
+            let gated = hasNewAudio
+                ? await Task.detached(priority: .userInitiated) {
+                    VoiceSpeechGate.partialAudio(window, minVoicedSeconds: minVoiced)
+                }.value
                 : nil
             guard !Task.isCancelled, state == .streaming else { return }
             if let voiced = gated {
                 lastTotal = total
+                onPassStarted?()
+                let passStart = Date()
                 let wav = VoiceWAVEncoder.encodePCM16Mono(samples: voiced, sampleRate: VoiceWhisperStreamPolicy.sampleRate)
                 do {
                     let text = try await transcriber.transcribe(
@@ -699,6 +759,7 @@ public final class VoiceWhisperStreamSession {
                         timeout: VoiceWhisperStreamPolicy.partialRequestTimeout,
                         isFinal: false
                     )
+                    lastPass = Date().timeIntervalSince(passStart)
                     guard !Task.isCancelled, state == .streaming else { return }
                     if !text.isEmpty {
                         onPartial(stabilizer.update(text, windowed: total > window.count))
@@ -708,8 +769,13 @@ public final class VoiceWhisperStreamSession {
                 }
             }
             // Until the first pass has run, poll quickly so the first text appears as soon as possible.
-            let interval = lastTotal == 0 ? 0.1 : VoiceWhisperStreamPolicy.partialInterval
-            let wait = max(0.1, interval - Date().timeIntervalSince(passStart))
+            let interval = lastTotal == 0 ? 0.08 : cadence.interval(
+                lastPass: lastPass,
+                thermal: ProcessInfo.processInfo.thermalState,
+                lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled,
+                memoryPressure: memoryPressure
+            )
+            let wait = max(0.03, interval - Date().timeIntervalSince(cycleStart))
             try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
         }
     }

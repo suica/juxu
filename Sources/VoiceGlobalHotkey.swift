@@ -300,6 +300,7 @@ public final class VoiceGlobalHotkeyController {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var recheck: Timer?
+    private var hasLoggedState = false
     private let committer = VoiceGlobalCommitter()
 
     private init() {
@@ -313,11 +314,16 @@ public final class VoiceGlobalHotkeyController {
 
     private func refresh() {
         let allowed = CGPreflightListenEventAccess()
+        let wasListening = tap != nil
         if allowed, tap == nil {
             startTap()
         } else if !allowed, tap != nil {
             VoiceSessionController.sharedIfLoaded?.cancelForChord()
             stopTap()
+        }
+        if !hasLoggedState || wasListening != (tap != nil) {
+            hasLoggedState = true
+            VoiceSessionTimeline.logListener(inputMonitoring: allowed, accessibility: AXIsProcessTrusted(), listening: tap != nil)
         }
     }
 
