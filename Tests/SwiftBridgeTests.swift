@@ -766,6 +766,104 @@ struct SwiftBridgeTests {
         assert(settingsWin.performKeyEquivalent(with: cmdW))
         assert(spy.closeCount == 1, "Expected Cmd+W to close SettingsWindow, got closeCount=\(spy.closeCount)")
 
-        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W & macOS Voice MVP tests passed!")
+        // 9. Verify Typeless-style VoiceContextCapture policy, JSON schema, blacklist, and UTF-16 cursor slicing
+        let defaultOpts = VoiceContextCaptureOptions()
+        assert(VoiceContextPolicy.isHardBlocked(bundleId: "com.1password.1password"))
+        assert(VoiceContextPolicy.isHardBlocked(bundleId: "com.apple.Passwords"))
+        assert(!VoiceContextPolicy.isHardBlocked(bundleId: "com.tinyspeck.slackmacgap"))
+
+        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.tencent.xinWeChat", webURL: nil, options: defaultOpts) == "app_blacklist:com.tencent.xinWeChat")
+        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.microsoft.Excel", webURL: nil, options: defaultOpts) == "app_blacklist:com.microsoft.Excel")
+        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.google.Chrome", webURL: "https://docs.google.com/document/d/abc123/edit", options: defaultOpts)?.hasPrefix("url_blacklist:") == true)
+        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.google.Chrome", webURL: "https://github.com/nameoverflow/juxu", options: defaultOpts) == nil)
+        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.tinyspeck.slackmacgap", webURL: nil, options: defaultOpts) == nil)
+
+        var noBlacklistOpts = VoiceContextCaptureOptions()
+        noBlacklistOpts.respectBlacklist = false
+        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.tencent.xinWeChat", webURL: nil, options: noBlacklistOpts) == nil)
+        // Password managers remain hard-blocked even when content blacklist is disabled.
+        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.1password.1password", webURL: nil, options: noBlacklistOpts) == "password_manager:com.1password.1password")
+
+        assert(VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://www.notion.so/page-1", role: "AXWebArea"))
+        assert(!VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://www.notion.so/page-1", role: "AXTextArea"))
+        assert(!VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://github.com", role: "AXWebArea"))
+
+        // Safe UTF-16 cursor slicing with CJK + emoji surrogate pairs
+        let mixedText = "你好😀世界abc"
+        // "你好" = 2 UTF-16, "😀" = 2 UTF-16, "世界" = 2 UTF-16 -> caret at UTF-16 offset 4 is right after "你好😀"
+        let sliced = VoiceContextPolicy.sliceCursorContext(
+            fullText: mixedText,
+            selectionLocationUTF16: 4,
+            selectionLengthUTF16: 2,
+            maxBeforeChars: 10,
+            maxAfterChars: 10,
+            maxSelectedChars: 10
+        )
+        assert(sliced.before == "你好😀", "Expected before='你好😀', got '\(sliced.before)'")
+        assert(sliced.selected == "世界", "Expected selected='世界', got '\(sliced.selected)'")
+        assert(sliced.after == "abc", "Expected after='abc', got '\(sliced.after)'")
+
+        assert(VoiceContextPolicy.normalizeURLCandidate("github.com/nameoverflow/juxu") == "https://github.com/nameoverflow/juxu")
+        assert(VoiceContextPolicy.normalizeURLCandidate("https://example.com/a?b=1") == "https://example.com/a?b=1")
+        assert(VoiceContextPolicy.normalizeURLCandidate("just some text") == nil)
+
+        let sampleCaptured = VoiceCapturedContext(
+            activeApplication: .init(
+                appName: "Slack",
+                appIdentifier: "com.tinyspeck.slackmacgap",
+                windowTitle: "#engineering",
+                webURL: nil,
+                appType: "electron_app",
+                isWebBrowser: false,
+                appMetadata: .init(processId: 1234, appPath: "/Applications/Slack.app"),
+                visibleScreenContent: "Alice: check CI"
+            ),
+            textInsertionPoint: .init(
+                inputAreaType: "rich_text",
+                accessibilityRole: "AXTextArea",
+                accessibilitySubrole: nil,
+                inputCapabilities: .init(isEditable: true, isSecure: false),
+                cursorState: .init(
+                    cursorPosition: 10,
+                    selectionLength: 0,
+                    hasTextSelected: false,
+                    selectedText: "",
+                    textBeforeCursor: "Let me check ",
+                    textAfterCursor: "now"
+                ),
+                surroundingContext: .init(
+                    textBeforeInputArea: "Channel: #engineering",
+                    textAfterInputArea: ""
+                )
+            ),
+            contextMetadata: .init(
+                isOwnApplication: false,
+                isAccessibilityTrusted: true,
+                enhancedUIEnabled: true,
+                isBlacklisted: false,
+                blacklistReason: nil,
+                isSecureInput: false,
+                timedOutVisible: false,
+                timedOutSurrounding: false,
+                elapsedMs: 12,
+                captureTimestamp: "2026-11-23T09:50:00Z"
+            )
+        )
+        let sampleJSON = sampleCaptured.prettyJSON()
+        assert(sampleJSON.contains("\"active_application\""))
+        assert(sampleJSON.contains("\"visible_screen_content\""))
+        assert(sampleJSON.contains("\"text_before_cursor\""))
+        assert(sampleJSON.contains("\"enhanced_ui_enabled\""))
+        let decodedCaptured = try! JSONDecoder().decode(VoiceCapturedContext.self, from: Data(sampleJSON.utf8))
+        assert(decodedCaptured == sampleCaptured)
+
+        let mergedCtx = VoiceContext(personalVocabulary: ["Juxu"]).merged(with: sampleCaptured)
+        assert(mergedCtx.bundleIdentifier == "com.tinyspeck.slackmacgap")
+        assert(mergedCtx.appName == "Slack")
+        assert(mergedCtx.beforeContext == "Let me check ")
+        assert(mergedCtx.afterContext == "now")
+        assert(mergedCtx.visibleScreenText == "Alice: check CI")
+
+        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W, VoiceContextCapture & macOS Voice MVP tests passed!")
     }
 }

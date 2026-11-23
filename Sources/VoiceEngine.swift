@@ -4,20 +4,67 @@ import Speech
 
 public struct VoiceContext: Sendable {
     public let bundleIdentifier: String?
+    public let appName: String?
+    public let windowTitle: String?
+    public let webURL: String?
     public let selectedText: String?
     public let beforeContext: String?
+    public let afterContext: String?
+    public let surroundingBefore: String?
+    public let surroundingAfter: String?
+    public let visibleScreenText: String?
     public let personalVocabulary: [String]
+    public let captured: VoiceCapturedContext?
 
     public init(
         bundleIdentifier: String? = nil,
+        appName: String? = nil,
+        windowTitle: String? = nil,
+        webURL: String? = nil,
         selectedText: String? = nil,
         beforeContext: String? = nil,
-        personalVocabulary: [String] = []
+        afterContext: String? = nil,
+        surroundingBefore: String? = nil,
+        surroundingAfter: String? = nil,
+        visibleScreenText: String? = nil,
+        personalVocabulary: [String] = [],
+        captured: VoiceCapturedContext? = nil
     ) {
         self.bundleIdentifier = bundleIdentifier
+        self.appName = appName
+        self.windowTitle = windowTitle
+        self.webURL = webURL
         self.selectedText = selectedText
         self.beforeContext = beforeContext
+        self.afterContext = afterContext
+        self.surroundingBefore = surroundingBefore
+        self.surroundingAfter = surroundingAfter
+        self.visibleScreenText = visibleScreenText
         self.personalVocabulary = personalVocabulary
+        self.captured = captured
+    }
+
+    public func merged(with captured: VoiceCapturedContext) -> VoiceContext {
+        let app = captured.activeApplication
+        let cur = captured.textInsertionPoint.cursorState
+        let sur = captured.textInsertionPoint.surroundingContext
+        let resolvedBundle = (bundleIdentifier?.isEmpty == false) ? bundleIdentifier : (app.appIdentifier.isEmpty ? nil : app.appIdentifier)
+        let resolvedSelected = (selectedText?.isEmpty == false) ? selectedText : (cur.selectedText.isEmpty ? nil : cur.selectedText)
+        let resolvedBefore = (beforeContext?.isEmpty == false) ? beforeContext : (cur.textBeforeCursor.isEmpty ? nil : cur.textBeforeCursor)
+        return VoiceContext(
+            bundleIdentifier: resolvedBundle,
+            appName: app.appName.isEmpty ? appName : app.appName,
+            windowTitle: app.windowTitle.isEmpty ? windowTitle : app.windowTitle,
+            webURL: app.webURL ?? webURL,
+            selectedText: resolvedSelected,
+            beforeContext: resolvedBefore,
+            afterContext: cur.textAfterCursor.isEmpty ? afterContext : cur.textAfterCursor,
+            surroundingBefore: sur.textBeforeInputArea.isEmpty ? surroundingBefore : sur.textBeforeInputArea,
+            surroundingAfter: sur.textAfterInputArea.isEmpty ? surroundingAfter : sur.textAfterInputArea,
+            visibleScreenText: app.visibleScreenContent ?? visibleScreenText,
+            personalVocabulary: personalVocabulary,
+            captured: captured
+        )
     }
 }
 
