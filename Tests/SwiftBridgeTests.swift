@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 @main
 struct SwiftBridgeTests {
@@ -663,6 +664,72 @@ struct SwiftBridgeTests {
             assert(listJSON.contains("句序测试"), "Expected imported user phrase in h2, got \(listJSON)")
         }
 
-        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo & macOS Voice MVP tests passed!")
+        // 10. Verify SettingsWindow handles Cmd+W close shortcut without requiring a main menu
+        func makeKeyEvent(
+            type: NSEvent.EventType = .keyDown,
+            chars: String,
+            ignoringModifiers: String,
+            modifiers: NSEvent.ModifierFlags,
+            keyCode: UInt16 = 13
+        ) -> NSEvent {
+            NSEvent.keyEvent(
+                with: type,
+                location: .zero,
+                modifierFlags: modifiers,
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: chars,
+                charactersIgnoringModifiers: ignoringModifiers,
+                isARepeat: false,
+                keyCode: keyCode
+            )!
+        }
+
+        let cmdW = makeKeyEvent(chars: "w", ignoringModifiers: "w", modifiers: .command)
+        let cmdCapsW = makeKeyEvent(chars: "W", ignoringModifiers: "W", modifiers: [.command, .capsLock])
+        let cmdNonLatinW = makeKeyEvent(chars: "w", ignoringModifiers: "ц", modifiers: .command)
+        let cmdShiftW = makeKeyEvent(chars: "W", ignoringModifiers: "w", modifiers: [.command, .shift])
+        let cmdOptW = makeKeyEvent(chars: "∑", ignoringModifiers: "w", modifiers: [.command, .option])
+        let cmdCtrlW = makeKeyEvent(chars: "w", ignoringModifiers: "w", modifiers: [.command, .control])
+        let plainW = makeKeyEvent(chars: "w", ignoringModifiers: "w", modifiers: [])
+        let cmdA = makeKeyEvent(chars: "a", ignoringModifiers: "a", modifiers: .command, keyCode: 0)
+        let cmdWKeyUp = makeKeyEvent(type: .keyUp, chars: "w", ignoringModifiers: "w", modifiers: .command)
+
+        assert(SettingsWindow.isCloseWindowShortcut(cmdW))
+        assert(SettingsWindow.isCloseWindowShortcut(cmdCapsW))
+        assert(SettingsWindow.isCloseWindowShortcut(cmdNonLatinW))
+        assert(!SettingsWindow.isCloseWindowShortcut(cmdShiftW))
+        assert(!SettingsWindow.isCloseWindowShortcut(cmdOptW))
+        assert(!SettingsWindow.isCloseWindowShortcut(cmdCtrlW))
+        assert(!SettingsWindow.isCloseWindowShortcut(plainW))
+        assert(!SettingsWindow.isCloseWindowShortcut(cmdA))
+        assert(!SettingsWindow.isCloseWindowShortcut(cmdWKeyUp))
+
+        final class CloseSpy: NSObject, NSWindowDelegate {
+            var closeCount = 0
+            func windowWillClose(_ notification: Notification) {
+                closeCount += 1
+            }
+        }
+        _ = NSApplication.shared
+        let spy = CloseSpy()
+        let settingsWin = SettingsWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: true
+        )
+        settingsWin.isReleasedWhenClosed = false
+        settingsWin.contentView = NSHostingView(rootView: SettingsRootView(bridge: bridge))
+        settingsWin.delegate = spy
+        assert(!settingsWin.performKeyEquivalent(with: cmdShiftW))
+        assert(!settingsWin.performKeyEquivalent(with: plainW))
+        assert(!settingsWin.performKeyEquivalent(with: cmdA))
+        assert(spy.closeCount == 0)
+        assert(settingsWin.performKeyEquivalent(with: cmdW))
+        assert(spy.closeCount == 1, "Expected Cmd+W to close SettingsWindow, got closeCount=\(spy.closeCount)")
+
+        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W & macOS Voice MVP tests passed!")
     }
 }

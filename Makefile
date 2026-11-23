@@ -109,7 +109,7 @@ rust-test:
 
 swift-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceSessionTimeline.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
+	swiftc -O $(MACOS_TARGET) $(UI_SOURCES) Tests/SwiftBridgeTests.swift $(CORE_FLAGS) $(FRAMEWORKS) -o build/swift-bridge-tests
 	build/swift-bridge-tests
 
 test: rust-test swift-test ios-test
