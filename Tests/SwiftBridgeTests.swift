@@ -287,6 +287,11 @@ struct SwiftBridgeTests {
         }
         precondition(VoiceSpeechGate.finalAudio(voiced) != nil, "periodic speech-like audio is kept")
         precondition(VoiceLocalASRModelPreset(rawValue: "whisper_turbo") == .whisperTurbo, "existing presets still decode")
+        precondition(VoiceLocalASRModelPreset(rawValue: "qwen3_asr") == .qwen3ASR)
+        precondition(VoiceQwenHelperManager.modelLanguage("zh") == "Chinese")
+        precondition(VoiceQwenHelperManager.modelLanguage("auto") == nil)
+        precondition(!VoiceQwenHelperManager.isLoaded, "Qwen helper must NOT be loaded before voice is enabled")
+        precondition(VoiceLocalASRModelPreset.qwen3ASR.descriptor.pinned?.isInstalled(at: FileManager.default.temporaryDirectory) == false, "no marker means not installed")
         for preset in VoiceLocalASRModelPreset.allCases {
             precondition(!preset.displayName.isEmpty, "every preset has a descriptor")
             precondition((preset.descriptor.executor != nil) == (preset.backend == .engine))
@@ -338,6 +343,7 @@ struct SwiftBridgeTests {
         _ = VoiceSessionController.shared
         _ = VoiceLocalInstaller.shared
         _ = VoiceWhisperServerManager.shared
+        _ = VoiceQwenHelperManager.shared
         assert(VoiceSessionController.isLoaded)
         assert(VoiceLocalInstaller.isLoaded)
         reloadedStore.update { $0.enabled = false }
@@ -345,6 +351,7 @@ struct SwiftBridgeTests {
         assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
         assert(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
         precondition(!VoiceWhisperServerManager.isLoaded, "Disabling voice must unload the whisper-server manager")
+        precondition(!VoiceQwenHelperManager.isLoaded, "Disabling voice must unload the Qwen helper manager")
 
         // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
         let defaultVoiceLLM = VoicePreferences()
