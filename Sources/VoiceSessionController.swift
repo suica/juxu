@@ -44,6 +44,7 @@ public final class VoiceSessionController {
     private var recordingStartTime: Date?
     private var latestLevel: Float = 0
     private var latestPartial: String = ""
+    private var latestTentativeCount = 0
     private var activeRecorder: VoiceAudioRecorder?
     private var activeStream: VoiceWhisperStreamSession?
     private var sessionGeneration: UInt64 = 0
@@ -283,6 +284,7 @@ public final class VoiceSessionController {
         activeCommitHandler = onCommit
         latestLevel = 0
         latestPartial = ""
+        latestTentativeCount = 0
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -344,7 +346,8 @@ public final class VoiceSessionController {
             },
             onPartial: { [weak self] partial in
                 guard let self, self.phase == .recording, self.sessionGeneration == generation else { return }
-                self.latestPartial = partial
+                self.latestPartial = partial.text
+                self.latestTentativeCount = partial.tentativeCount
             }
         )
         activeStream = stream
@@ -649,7 +652,8 @@ public final class VoiceSessionController {
                 level: latestLevel,
                 elapsed: elapsed,
                 partial: latestPartial,
-                modeLabel: modeLabel
+                modeLabel: modeLabel,
+                tentativeCount: latestTentativeCount
             ),
             caretRect: activeCaretRect,
             clientWindowLevel: activeWindowLevel
