@@ -371,6 +371,82 @@ struct SwiftBridgeTests {
         precondition(!VoiceWhisperServerManager.isLoaded, "Disabling voice must unload the whisper-server manager")
         precondition(!VoiceQwenHelperManager.isLoaded, "Disabling voice must unload the Qwen helper manager")
 
+        // Global voice key: off by default, and existing settings files are unaffected.
+        let legacyVoice = try! JSONEncoder().encode(VoicePreferences())
+        precondition(!String(decoding: legacyVoice, as: UTF8.self).contains("globalVoiceHotkey"), "off leaves voice.json unchanged")
+        precondition(try! JSONDecoder().decode(VoicePreferences.self, from: legacyVoice).isGlobalHotkeyEnabled == false)
+        precondition(!VoiceGlobalHotkeyController.isLoaded && !VoiceGlobalHotkeyController.isListening, "nothing listens while off")
+        var globalOn = VoicePreferences(); globalOn.globalVoiceHotkey = true
+        precondition(try! JSONDecoder().decode(VoicePreferences.self, from: JSONEncoder().encode(globalOn)).isGlobalHotkeyEnabled)
+
+        let route = { (down: Bool, key: UInt16, flags: NSEvent.ModifierFlags, secure: Bool, recording: Bool) in
+            VoiceGlobalKeyRouter.decide(isKeyDown: down, keyCode: key, flags: flags, trigger: .rightCommand, isSecureInput: secure, isRecording: recording)
+        }
+        precondition(route(false, 0x36, .command, false, false) == .forward, "the trigger reaches the hold logic")
+        precondition(route(true, 8, .command, false, false) == .forward, "a chord reaches the pending hold and cancels it")
+        precondition(route(true, 8, .command, false, true) == .cancelChord, "a shortcut during recording cancels dictation")
+        precondition(route(true, 0x35, [], false, true) == .forward, "Esc cancels")
+        precondition(route(false, 0x36, .command, true, false) == .ignore, "secure input never starts a recording")
+        precondition(route(true, 8, [], true, false) == .ignore, "keys in secure input are not read")
+        precondition(route(false, 0x36, [], true, true) == .forward, "a recording in progress can still end")
+        precondition(VoiceGlobalKeyRouter.decide(isKeyDown: true, keyCode: 0x31, flags: .option, trigger: .optionSpace, isSecureInput: false, isRecording: false) == .ignore, "Option+Space is not global")
+
+        let commitRoute = { (secure: Bool, same: Bool, imk: Bool, ax: Bool, field: Bool) in
+            VoiceGlobalCommitPolicy.route(isSecure: secure, focusUnchanged: same, hasInputMethodClient: imk, hasAccessibility: ax, hasTextField: field)
+        }
+        precondition(commitRoute(false, true, true, false, false) == .inputMethod)
+        precondition(commitRoute(false, true, false, true, true) == .accessibility)
+        for blocked in [commitRoute(true, true, true, true, true), commitRoute(false, false, true, true, true), commitRoute(false, true, false, false, true), commitRoute(false, true, false, true, false)] {
+            if case .clipboardOnly = blocked { continue }
+            preconditionFailure("password fields, changed focus and missing targets must keep the text on the clipboard")
+        }
+
+        let testBoard = NSPasteboard(name: NSPasteboard.Name("juxu.tests.\(UUID().uuidString)"))
+        testBoard.clearContents()
+        let richItem = NSPasteboardItem()
+        richItem.setString("原来的内容", forType: .string)
+        richItem.setData(Data([1, 2, 3]), forType: NSPasteboard.PasteboardType("com.juxu.test"))
+        testBoard.writeObjects([richItem])
+        let boardSnapshot = VoiceClipboardSnapshot(testBoard)
+        testBoard.clearContents(); testBoard.setString("听写文字", forType: .string)
+        boardSnapshot.restore(to: testBoard)
+        precondition(testBoard.string(forType: .string) == "原来的内容", "the clipboard text is restored")
+        precondition(testBoard.data(forType: NSPasteboard.PasteboardType("com.juxu.test")) == Data([1, 2, 3]), "every clipboard type is restored")
+        testBoard.releaseGlobally()
+
+        // Hold logic, fed the same synthetic events a listener would deliver. The microphone is never started.
+        VoicePreferencesStore.shared.update({ $0.enabled = true; $0.triggerKey = .rightCommand }, persist: false)
+        let holdSession = VoiceSessionController.shared
+        var holdStarts = 0
+        holdSession.startRecordingOverride = { holdStarts += 1 }
+        let command = { (down: Bool) -> NSEvent in
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x36, keyDown: down)!
+            e.type = .flagsChanged
+            e.flags = down ? .maskCommand : []
+            return NSEvent(cgEvent: e)!
+        }
+        let keyC: NSEvent = {
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true)!
+            e.flags = .maskCommand
+            return NSEvent(cgEvent: e)!
+        }()
+        let feed = { (event: NSEvent) in
+            _ = holdSession.handleEvent(event, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        }
+        let wait = { (seconds: TimeInterval) in RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
+        feed(command(true)); wait(0.10); precondition(holdStarts == 0, "no start before the hold threshold"); wait(0.25)
+        precondition(holdStarts == 1, "a 0.22 s hold starts dictation"); feed(command(false))
+        feed(command(true)); wait(0.05); feed(keyC); wait(0.32); precondition(holdStarts == 1, "right-Command-C cancels the pending hold"); feed(command(false))
+        feed(command(true)); wait(0.05); feed(command(false)); wait(0.32); precondition(holdStarts == 1, "a quick tap does nothing")
+        feed(command(true)); wait(0.05); holdSession.handleDeactivate(); wait(0.32); precondition(holdStarts == 1, "without the global key, deactivation cancels as before"); feed(command(false))
+        VoiceGlobalHotkeyController.testingForceListening = true
+        precondition(VoiceGlobalHotkeyController.isListening)
+        feed(command(true)); wait(0.05); holdSession.handleDeactivate(); wait(0.32); precondition(holdStarts == 2, "with the global key, switching app does not cancel"); feed(command(false))
+        VoiceGlobalHotkeyController.testingForceListening = false
+        holdSession.startRecordingOverride = nil
+        VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)
+        precondition(!VoiceSessionController.isLoaded && !VoiceGlobalHotkeyController.isLoaded, "turning voice off releases the listener")
+
         // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
         let defaultVoiceLLM = VoicePreferences()
         assert(defaultVoiceLLM.localLLMPreset == .qwen15B)

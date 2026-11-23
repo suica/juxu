@@ -50,9 +50,15 @@ public final class JuxuInputController: IMKInputController {
         sawClientSupportForRanges = false
         autoPairClosers.removeAll()
         configurePanelCallbacks()
+        VoiceGlobalCommitter.setInputMethodSink(owner: self) { [weak self] text in
+            guard let self, self.activeClient != nil else { return false }
+            self.commitVoiceText(text, replaceSelection: false, client: self.activeClient)
+            return true
+        }
     }
 
     public override func deactivateServer(_ sender: Any!) {
+        VoiceGlobalCommitter.clearInputMethodSink(owner: self)
         VoiceSessionController.sharedIfLoaded?.handleDeactivate()
         saveUserDataTimer?.invalidate()
         saveUserDataTimer = nil
@@ -95,7 +101,12 @@ public final class JuxuInputController: IMKInputController {
         JuxuBridge.shared.suppressEvalLogging = IsSecureEventInputEnabled()
 
         // Strictly on-demand voice entry: when disabled, zero voice controllers or panels are loaded.
-        if VoicePreferencesStore.shared.prefs.enabled {
+        if VoiceGlobalHotkeyController.isListening {
+            // The global listener already saw this key; only keep typing out of a recording.
+            if event.type == .keyDown, VoiceSessionController.sharedIfLoaded?.isRecording == true {
+                return true
+            }
+        } else if VoicePreferencesStore.shared.prefs.enabled {
             let consumedByVoice = VoiceSessionController.shared.handleEvent(
                 event,
                 caretRectProvider: { [weak self, weak clientObj] in
