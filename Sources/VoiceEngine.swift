@@ -302,6 +302,8 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     private var appleFinalContinuation: CheckedContinuation<String, Error>?
     private var appleFinished = false
     private var levelMeter = VoiceLevelMeter()
+    /// Buffers per whole dBFS, for the timing log. Holds no audio.
+    private var levelHistogram = [Int](repeating: 0, count: 91)
 
     public var onAudioLevel: (@Sendable (Float) -> Void)?
     public var onPartialTranscript: (@Sendable (String) -> Void)?
@@ -419,6 +421,10 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                 }
                 let rms = sqrt(sum / Float(count))
                 let seconds = Float(Double(count) / buffer.format.sampleRate)
+                let bucket = Int((20 * log10(max(rms, 1e-6))).rounded()) + 90
+                lock.lock()
+                levelHistogram[max(0, min(90, bucket))] += 1
+                lock.unlock()
                 onAudioLevel?(levelMeter.process(rms: rms, seconds: seconds))
             }
         }
@@ -468,6 +474,25 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     }
 
     /// Copies at most the newest `maxCount` samples while recording continues.
+    /// Input loudness percentiles in dBFS for the timing log.
+    public func levelSummary() -> String {
+        lock.lock()
+        let histogram = levelHistogram
+        lock.unlock()
+        let total = histogram.reduce(0, +)
+        guard total > 0 else { return "" }
+        let percentile = { (p: Int) -> Int in
+            var seen = 0
+            for (i, n) in histogram.enumerated() {
+                seen += n
+                if seen * 100 >= total * p { return i - 90 }
+            }
+            return 0
+        }
+        let top = (histogram.lastIndex { $0 > 0 } ?? 0) - 90
+        return "dbfs_p10=\(percentile(10)) dbfs_p50=\(percentile(50)) dbfs_p90=\(percentile(90)) dbfs_p99=\(percentile(99)) dbfs_max=\(top) buffers=\(total)"
+    }
+
     public func snapshotRecentSamples(maxCount: Int) -> (samples: [Int16], total: Int) {
         lock.lock()
         defer { lock.unlock() }
