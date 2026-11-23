@@ -301,6 +301,7 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     private var latestAppleTranscript: String = ""
     private var appleFinalContinuation: CheckedContinuation<String, Error>?
     private var appleFinished = false
+    private var levelMeter = VoiceLevelMeter()
 
     public var onAudioLevel: (@Sendable (Float) -> Void)?
     public var onPartialTranscript: (@Sendable (String) -> Void)?
@@ -407,7 +408,7 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     }
 
     private func processBuffer(_ buffer: AVAudioPCMBuffer) {
-        // Compute normalized RMS audio level for HUD bars
+        // HUD meter only: the audio sent to the recogniser is converted below, untouched by this.
         if let channelData = buffer.floatChannelData?[0] {
             let count = Int(buffer.frameLength)
             if count > 0 {
@@ -417,8 +418,8 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                     sum += s * s
                 }
                 let rms = sqrt(sum / Float(count))
-                let level = min(1.0, max(0.0, rms * 8.5))
-                onAudioLevel?(level)
+                let seconds = Float(Double(count) / buffer.format.sampleRate)
+                onAudioLevel?(levelMeter.process(rms: rms, seconds: seconds))
             }
         }
 

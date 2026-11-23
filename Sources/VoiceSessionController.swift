@@ -44,6 +44,7 @@ public final class VoiceSessionController {
     private var levelTimer: Timer?
     private var recordingStartTime: Date?
     private var latestLevel: Float = 0
+    private var peakLevelSinceDraw: Float?
     private var latestPartial: String = ""
     private var latestTentativeCount = 0
     private var timeline = VoiceSessionTimeline()
@@ -315,6 +316,7 @@ public final class VoiceSessionController {
         activeContext = context
         activeCommitHandler = onCommit
         latestLevel = 0
+        peakLevelSinceDraw = nil
         latestPartial = ""
         latestTentativeCount = 0
 
@@ -363,7 +365,8 @@ public final class VoiceSessionController {
             recorder.onAudioLevel = { [weak self] level in
                 let time = CFAbsoluteTimeGetCurrent()
                 Task { @MainActor [weak self] in
-                    self?.latestLevel = level
+                    // Several buffers can arrive per HUD frame; keep the loudest so peaks are not dropped.
+                    self?.peakLevelSinceDraw = max(self?.peakLevelSinceDraw ?? 0, level)
                     self?.timeline.mark(.firstBuffer, at: time)
                 }
             }
@@ -725,6 +728,10 @@ public final class VoiceSessionController {
     private func refreshRecordingHUD() {
         guard phase == .recording else { return }
         if !latestPartial.isEmpty { timeline.mark(.firstDraw) }
+        if let peak = peakLevelSinceDraw {
+            latestLevel = peak
+            peakLevelSinceDraw = nil
+        }
         let elapsed = Date().timeIntervalSince(recordingStartTime ?? Date())
         let modeLabel = VoicePreferencesStore.shared.prefs.providerMode == .cloudBYOK
             ? VoicePreferencesStore.shared.prefs.cloudPreset.displayName
