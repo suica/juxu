@@ -503,6 +503,7 @@ public final class VoiceSessionController {
         activeStream = nil
         let generation = sessionGeneration
         let samples = recorder.stopAndCollectSamples()
+        timeline.levelSummary = recorder.levelSummary()
         let elapsed = Date().timeIntervalSince(recordingStartTime ?? Date())
         phase = .processing
 

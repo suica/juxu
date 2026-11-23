@@ -14,10 +14,13 @@ struct VoiceSessionTimeline {
     )
     private var times: [Mark: CFAbsoluteTime] = [:]
     private var passes = 0
+    /// Aggregate input loudness for the session. Never audio or text.
+    var levelSummary = ""
 
     mutating func begin() {
         times = [.keyDown: CFAbsoluteTimeGetCurrent()]
         passes = 0
+        levelSummary = ""
     }
 
     /// Keeps the first time each point is reached.
@@ -34,7 +37,8 @@ struct VoiceSessionTimeline {
         let points = Mark.allCases.compactMap { mark in
             times[mark].map { "\(mark.rawValue)=\(Int(($0 - start) * 1000))" }
         }
-        return (points + ["passes=\(passes)"]).joined(separator: " ")
+        let levels = levelSummary.isEmpty ? [] : [levelSummary]
+        return (points + ["passes=\(passes)"] + levels).joined(separator: " ")
     }
 
     func log() {
