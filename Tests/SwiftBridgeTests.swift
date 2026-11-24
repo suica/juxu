@@ -458,6 +458,12 @@ struct SwiftBridgeTests {
             if case .clipboardOnly = blocked { continue }
             preconditionFailure("password fields, changed focus and missing targets must keep the text on the clipboard")
         }
+        precondition(
+            VoiceGlobalCommitPolicy.route(isSecure: false, focusUnchanged: true, hasInputMethodClient: false, hasAccessibility: true, hasTextField: false, allowsPasteFallback: true) == .pasteFallback,
+            "custom-rendered apps without native AXTextField fall back to paste"
+        )
+        precondition(VoiceGlobalCommitPolicy.allowsPasteFallback(bundleIdentifier: "com.tencent.xinWeChat", elementRole: nil), "WeChat 4.x allows paste fallback")
+        precondition(!VoiceGlobalCommitPolicy.allowsPasteFallback(bundleIdentifier: "com.apple.finder", elementRole: "AXGroup"), "Finder must not blindly paste")
 
         let testBoard = NSPasteboard(name: NSPasteboard.Name("juxu.tests.\(UUID().uuidString)"))
         testBoard.clearContents()

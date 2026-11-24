@@ -98,23 +98,62 @@ public struct VoiceClipboardSnapshot {
 public enum VoiceGlobalInsertRoute: Equatable {
     case inputMethod
     case accessibility
+    case pasteFallback
     case clipboardOnly(String)
 }
 
 public enum VoiceGlobalCommitPolicy {
+    /// Apps whose custom/Qt/Electron/terminal text fields do not expose standard AXTextField roles.
+    private static let pasteFallbackBundlePrefixes: [String] = [
+        "com.tencent.xinwechat",
+        "com.tencent.wechat",
+        "com.tencent.qq",
+        "com.electron.",
+        "com.bytedance.lark",
+        "com.alibaba.dingtalk",
+        "com.tinyspeck.slackmacgap",
+        "com.hnc.discord",
+        "ru.keepcoder.telegram",
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "com.mitchellh.ghostty",
+        "dev.warp.warp-stable",
+        "net.kovidgoyal.kitty",
+        "org.alacritty",
+        "com.microsoft.vscode",
+        "com.todesktop.230313mzl4w4u92", // Cursor
+        "dev.zed.zed",
+        "com.jetbrains.",
+    ]
+
+    public static func allowsPasteFallback(bundleIdentifier: String?, elementRole: String?) -> Bool {
+        if let bid = bundleIdentifier?.lowercased() {
+            if bid == "com.apple.finder" { return false }
+            if pasteFallbackBundlePrefixes.contains(where: { bid.hasPrefix($0) }) {
+                return true
+            }
+        }
+        if let role = elementRole, ["AXWebArea", "AXGroup", "AXScrollArea", "AXUnknown"].contains(role) {
+            return true
+        }
+        return false
+    }
+
     public static func route(
         isSecure: Bool,
         focusUnchanged: Bool,
         hasInputMethodClient: Bool,
         hasAccessibility: Bool,
-        hasTextField: Bool
+        hasTextField: Bool,
+        allowsPasteFallback: Bool = false
     ) -> VoiceGlobalInsertRoute {
         if isSecure { return .clipboardOnly("密码框不会写入，文字已放到剪贴板") }
         if !focusUnchanged { return .clipboardOnly("焦点已变化，文字已放到剪贴板") }
         if hasInputMethodClient { return .inputMethod }
         if !hasAccessibility { return .clipboardOnly("未授权辅助功能，文字已放到剪贴板") }
-        if !hasTextField { return .clipboardOnly("没有可输入的位置，文字已放到剪贴板") }
-        return .accessibility
+        if hasTextField { return .accessibility }
+        if allowsPasteFallback { return .pasteFallback }
+        return .clipboardOnly("没有可输入的位置，文字已放到剪贴板")
     }
 }
 
@@ -185,8 +224,12 @@ final class VoiceGlobalCommitter {
 
     private func focusUnchanged(_ current: AXUIElement?) -> Bool {
         guard let pid = target.pid, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
-        if let before = target.element, let current { return CFEqual(before, current) }
-        return target.element == nil && current == nil
+        if let before = target.element, let current {
+            if CFEqual(before, current) { return true }
+            // Custom-rendered apps (e.g. WeChat 4.x Qt, Electron) often return fresh AX wrappers for the same surface.
+            return !(Self.isTextField(before) && Self.isTextField(current))
+        }
+        return true
     }
 
     /// Inserts `text` into the original field, or leaves it on the clipboard. Returns a notice, if any.
@@ -194,12 +237,18 @@ final class VoiceGlobalCommitter {
         let current = Self.focusedElement()
         let isSecure = IsSecureEventInputEnabled()
             || current.flatMap { Self.string($0, kAXSubroleAttribute) } == kAXSecureTextFieldSubrole
+        let frontBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let currentRole = current.flatMap { Self.string($0, kAXRoleAttribute) }
         let route = VoiceGlobalCommitPolicy.route(
             isSecure: isSecure,
             focusUnchanged: focusUnchanged(current),
             hasInputMethodClient: Self.inputMethodSink != nil,
             hasAccessibility: AXIsProcessTrusted(),
-            hasTextField: Self.isTextField(current)
+            hasTextField: Self.isTextField(current),
+            allowsPasteFallback: VoiceGlobalCommitPolicy.allowsPasteFallback(
+                bundleIdentifier: frontBundleID,
+                elementRole: currentRole
+            )
         )
         switch route {
         case .inputMethod:
@@ -223,6 +272,8 @@ final class VoiceGlobalCommitter {
             } else {
                 Self.paste(text, into: current, completion: completion)
             }
+        case .pasteFallback:
+            Self.paste(text, into: current, silentWhenUnverifiable: true, completion: completion)
         }
     }
 
@@ -242,29 +293,39 @@ final class VoiceGlobalCommitter {
 
     /// Pastes, then restores the user's clipboard only if the text is confirmed in the field.
     /// If it cannot be confirmed the text stays on the clipboard, so it is never lost.
-    private static func paste(_ text: String, into element: AXUIElement, completion: @escaping @MainActor (String?) -> Void) {
+    private static func paste(
+        _ text: String,
+        into element: AXUIElement?,
+        silentWhenUnverifiable: Bool = false,
+        completion: @escaping @MainActor (String?) -> Void
+    ) {
         let pasteboard = NSPasteboard.general
         let snapshot = VoiceClipboardSnapshot(pasteboard)
-        let before = string(element, kAXValueAttribute)
+        let before = element.flatMap { string($0, kAXValueAttribute) }
         leaveOnClipboard(text)
         let stamp = pasteboard.changeCount
         let source = CGEventSource(stateID: .hidSystemState)
         let vKey = CGKeyCode(kVK_ANSI_V)
-        for keyDown in [true, false] {
-            let event = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: keyDown)
-            event?.flags = .maskCommand
-            event?.post(tap: .cghidEventTap)
+        if let down = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true) {
+            down.flags = .maskCommand
+            down.post(tap: .cghidEventTap)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.015) {
+            if let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false) {
+                up.flags = .maskCommand
+                up.post(tap: .cghidEventTap)
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             MainActor.assumeIsolated {
-                let after = string(element, kAXValueAttribute)
+                let after = element.flatMap { string($0, kAXValueAttribute) }
                 let confirmed = after != nil && after != before && after?.contains(text) == true
                 if confirmed {
                     // The user may have copied something else in the meantime.
                     if pasteboard.changeCount == stamp { snapshot.restore(to: pasteboard) }
                     completion(nil)
                 } else {
-                    completion("已粘贴；无法确认，文字也留在剪贴板")
+                    completion(silentWhenUnverifiable ? nil : "已粘贴；无法确认，文字也留在剪贴板")
                 }
             }
         }
