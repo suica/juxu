@@ -43,6 +43,8 @@ public final class VoiceSessionController {
     private static let engineWarmDelay: TimeInterval = 0.3
     /// A press shorter than this with no speech in it is a tap: it ends silently.
     private static let tapWindow: TimeInterval = 0.6
+    /// Keep capturing briefly after key-up so CoreAudio's ~100 ms tap buffer and trailing syllables arrive.
+    private static let releaseTailDelay: TimeInterval = 0.18
     private var engineWarmItem: DispatchWorkItem?
     private var engineWarmed = false
     private var warmHold: (any VoiceASREngine)?
@@ -653,12 +655,11 @@ public final class VoiceSessionController {
         timeline.mark(.release)
         let stream = activeStream
         activeStream = nil
+        stream?.stopPartials()
         let generation = sessionGeneration
-        let samples = recorder.stopAndCollectSamples()
-        // Played only after the microphone has stopped, so it cannot be captured.
-        if endCue { playCue(.end) }
-        timeline.levelSummary = recorder.levelSummary()
         let elapsed = Date().timeIntervalSince(recordingStartTime ?? Date())
+        let partialText = latestPartial.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasLivePartial = !partialText.isEmpty
         phase = .processing
 
         let prefs = VoicePreferencesStore.shared.prefs
@@ -670,15 +671,6 @@ public final class VoiceSessionController {
         let commitHandler = activeCommitHandler
         let replaceSelection = prefs.speakToEditSelection
             && !(context.selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-
-        if !isShortPress && elapsed < 0.25 && samples.count < 3200 && latestPartial.isEmpty {
-            stream?.cancel()
-            recorder.cancel()
-            activeRecorder = nil
-            phase = .idle
-            showNotice(VoiceEngineError.recordingTooShort.localizedDescription, isError: false, duration: 1.1)
-            return
-        }
 
         let showTranscribing = { [weak self] in
             guard let self else { return }
@@ -708,19 +700,33 @@ public final class VoiceSessionController {
                 }
             }
 
-            if isShortPress {
-                let speech = await Task.detached(priority: .userInitiated) {
-                    VoiceSpeechGate.finalAudio(samples)
-                }.value
-                guard !Task.isCancelled, speech != nil else {
+            do {
+                try await Task.sleep(nanoseconds: UInt64(Self.releaseTailDelay * 1_000_000_000))
+                try Task.checkCancellation()
+                let samples = recorder.stopAndCollectSamples()
+                // Played only after the microphone has stopped, so it cannot be captured.
+                if endCue { self.playCue(.end) }
+                self.timeline.levelSummary = recorder.levelSummary()
+
+                if !isShortPress && elapsed < 0.25 && samples.count < 3200 && !hasLivePartial {
                     recorder.cancel()
-                    VoiceHUDPanelController.shared.hide()
+                    self.showNotice(VoiceEngineError.recordingTooShort.localizedDescription, isError: false, duration: 1.1)
                     return
                 }
-                showTranscribing()
-            }
 
-            do {
+                if isShortPress {
+                    let speech = await Task.detached(priority: .userInitiated) {
+                        VoiceSpeechGate.finalAudio(samples)
+                    }.value
+                    try Task.checkCancellation()
+                    guard speech != nil || hasLivePartial else {
+                        recorder.cancel()
+                        VoiceHUDPanelController.shared.hide()
+                        return
+                    }
+                    showTranscribing()
+                }
+
                 let rawTranscript: String
                 if useAppleSpeech {
                     rawTranscript = try await recorder.finishAppleSpeech()
@@ -734,11 +740,16 @@ public final class VoiceSessionController {
                             VoiceSpeechGate.finalAudio(samples)
                         }.value
                         try Task.checkCancellation()
-                        guard let speech = gated else {
+                        if let speech = gated {
+                            audio = speech.audio
+                            voicedSeconds = speech.voicedSeconds
+                        } else if hasLivePartial {
+                            // Live partials already recognised speech; never reject at release.
+                            audio = samples
+                            voicedSeconds = max(0.5, Double(partialText.count) * VoiceHallucinationFilter.secondsPerOrdinaryChar)
+                        } else {
                             throw VoiceEngineError.noSpeechDetected
                         }
-                        audio = speech.audio
-                        voicedSeconds = speech.voicedSeconds
                     }
                     let wavData = VoiceWAVEncoder.encodePCM16Mono(samples: audio, sampleRate: 16_000)
                     var residentText: String?

@@ -287,6 +287,44 @@ struct SwiftBridgeTests {
             voiced[i] = Int16(3_000 * envelope * sin(2 * Double.pi * 150 * Double(i) / 16_000))
         }
         precondition(VoiceSpeechGate.finalAudio(voiced) != nil, "periodic speech-like audio is kept")
+        // Continuous speech filling the entire clip (no 10% silence) must still pass the gate.
+        var continuous = [Int16](repeating: 0, count: 32_000)
+        for i in 0..<continuous.count {
+            let envelope = 0.7 + 0.3 * sin(2 * Double.pi * 3.5 * Double(i) / 16_000)
+            continuous[i] = Int16(500 * envelope * sin(2 * Double.pi * 160 * Double(i) / 16_000))
+        }
+        precondition(VoiceSpeechGate.finalAudio(continuous) != nil, "continuous speech without silence passes the gate")
+        // Quiet speech (~ -39 dBFS) over steady room noise (~ -44 dBFS) must pass, while noise alone is rejected.
+        var rngState: UInt64 = 0x1234_5678_9abc_def0
+        let nextNoise = { () -> Double in
+            rngState = rngState &* 6364136223846793005 &+ 1442695040888963407
+            let u = Double((rngState >> 33) & 0x7fff_ffff) / Double(0x7fff_ffff)
+            return u * 2.0 - 1.0
+        }
+        let noiseOnly = (0..<48_000).map { _ in Int16(360 * nextNoise()) }
+        precondition(VoiceSpeechGate.finalAudio(noiseOnly) == nil, "steady broadband room noise is rejected")
+        var quietSpeechOverNoise = (0..<48_000).map { _ in Int16(360 * nextNoise()) }
+        for i in 16_000..<32_000 {
+            let sig = 480 * sin(2 * Double.pi * 155 * Double(i) / 16_000)
+            quietSpeechOverNoise[i] = Int16(max(-32767, min(32767, Double(quietSpeechOverNoise[i]) + sig)))
+        }
+        precondition(VoiceSpeechGate.finalAudio(quietSpeechOverNoise) != nil, "quiet speech over room noise passes the gate")
+        // A brief single-syllable word (~140 ms) must not be rejected as silence.
+        var briefWord = [Int16](repeating: 0, count: 24_000)
+        for i in 8_000..<10_240 {
+            briefWord[i] = Int16(300 * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        precondition(VoiceSpeechGate.finalAudio(briefWord) != nil, "brief single-syllable speech passes the gate")
+        // partialAudio must keep trailing audio to the end of the window so quiet final words are not clipped.
+        var trailingQuiet = [Int16](repeating: 0, count: 48_000)
+        for i in 8_000..<24_000 {
+            trailingQuiet[i] = Int16(2_500 * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        for i in 32_000..<44_000 {
+            trailingQuiet[i] = Int16(45 * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        let partialKept = VoiceSpeechGate.partialAudio(trailingQuiet)
+        precondition(partialKept != nil && partialKept!.count >= 40_000, "partialAudio preserves quiet trailing words")
         precondition(VoiceLocalASRModelPreset(rawValue: "whisper_turbo") == .whisperTurbo, "existing presets still decode")
         precondition(VoiceLocalASRModelPreset(rawValue: "qwen3_asr") == .qwen3ASR)
         precondition(VoiceQwenHelperManager.modelLanguage("zh") == "Chinese")

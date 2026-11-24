@@ -127,19 +127,19 @@ public enum VoiceSpeechGate {
     static let windowSamples = 640 // 40 ms
     static let minLag = 40 // 400 Hz
     static let maxLag = 228 // 70 Hz
-    static let voicingThreshold: Float = 0.40
+    static let voicingThreshold: Float = 0.32
     static let minLevel: Float = 60
-    static let noiseFloorRatio: Float = 2.0
+    static let noiseFloorRatio: Float = 1.20
     static let maxGapFrames = 10
     static let minRunDensity = 0.5
     /// A long voiced run is speech at any level, so quiet far-field talkers are kept.
-    static let longRunFrames = 20
-    /// A short run, such as one spoken word, must also be clearly louder than background murmur.
-    static let shortRunFrames = 10
-    static let shortRunLevel: Float = 120
+    static let longRunFrames = 12
+    /// A short run, such as a single spoken syllable (~100 ms), passes as long as it is above floor.
+    static let shortRunFrames = 5
+    static let shortRunLevel: Float = 80
     /// Below this much audio, the clip's own level statistics cannot tell speech from background.
     static let earlyWindowSeconds = 1.0
-    /// In such a window the floor may be speech, so it can only raise the threshold this far.
+    /// When the clip has too few non-periodic frames to estimate room noise, cap the floor threshold.
     static let earlyFloorCap: Float = 200
 
     private static let hann: [Float] = (0..<windowSamples).map {
@@ -198,13 +198,17 @@ public enum VoiceSpeechGate {
         let (levels, voicing) = frameFeatures(samples)
         guard !levels.isEmpty else { return [] }
         var flags = [Bool](repeating: false, count: levels.count)
-        let sorted = levels.sorted()
-        let position = Float(sorted.count - 1) * 0.1
+        // Estimate room noise from non-periodic frames when enough exist, so continuous speech
+        // with <10% silence does not treat spoken syllables as the noise floor.
+        let unvoicedLevels = levels.indices.compactMap { voicing[$0] < voicingThreshold ? levels[$0] : nil }
+        let hasReliableNoiseFloor = trustNoiseFloor && unvoicedLevels.count >= max(5, levels.count / 10)
+        let floorSource = hasReliableNoiseFloor ? unvoicedLevels.sorted() : levels.sorted()
+        let position = Float(floorSource.count - 1) * 0.1
         let lower = Int(position)
-        let upper = min(lower + 1, sorted.count - 1)
-        let floor = sorted[lower] + (sorted[upper] - sorted[lower]) * (position - Float(lower))
+        let upper = min(lower + 1, floorSource.count - 1)
+        let floor = floorSource[lower] + (floorSource[upper] - floorSource[lower]) * (position - Float(lower))
         let floorThreshold = floor * noiseFloorRatio
-        let threshold = max(minLevel, trustNoiseFloor ? floorThreshold : min(floorThreshold, earlyFloorCap))
+        let threshold = max(minLevel, hasReliableNoiseFloor ? floorThreshold : min(floorThreshold, earlyFloorCap))
         let voiced = levels.indices.filter { voicing[$0] >= voicingThreshold && levels[$0] >= threshold }
         guard voiced.count >= shortRunFrames else { return flags }
 
@@ -234,19 +238,22 @@ public enum VoiceSpeechGate {
     static func speechSlice(
         _ samples: [Int16],
         leadSeconds: Double,
-        tailSeconds: Double,
+        tailSeconds: Double?,
         trustNoiseFloor: Bool = true
     ) -> (audio: [Int16], voicedSeconds: Double)? {
         let flags = voicedFrames(samples, trustNoiseFloor: trustNoiseFloor)
         guard let first = flags.firstIndex(of: true), let last = flags.lastIndex(of: true) else { return nil }
         let rate = Double(VoiceWhisperStreamPolicy.sampleRate)
         let start = max(0, first * hopSamples - Int(leadSeconds * rate))
-        let end = min(samples.count, last * hopSamples + windowSamples + Int(tailSeconds * rate))
+        let end = tailSeconds.map {
+            min(samples.count, last * hopSamples + windowSamples + Int($0 * rate))
+        } ?? samples.count
         let voiced = Double(flags.lazy.filter { $0 }.count) * Double(hopSamples) / rate
         return (Array(samples[start..<end]), voiced)
     }
 
     /// Audio for a partial pass, or nil until there is enough speech to be worth transcribing.
+    /// Keeps audio through the end of the window so quiet trailing words are never clipped.
     public static func partialAudio(
         _ window: [Int16],
         minVoicedSeconds: Double = VoicePartialCadence.standard.minVoicedSeconds
@@ -256,7 +263,7 @@ public enum VoiceSpeechGate {
         guard let slice = speechSlice(
             window,
             leadSeconds: 0.2,
-            tailSeconds: 0.3,
+            tailSeconds: nil,
             trustNoiseFloor: seconds >= earlyWindowSeconds
         ),
               slice.voicedSeconds >= minVoicedSeconds else { return nil }
@@ -706,6 +713,12 @@ public final class VoiceWhisperStreamSession {
         loopTask = Task { @MainActor [weak self] in
             await self?.runPartialLoop()
         }
+    }
+
+    /// Stops issuing new partial passes while keeping the session open for `finish`.
+    public func stopPartials() {
+        loopTask?.cancel()
+        loopTask = nil
     }
 
     /// Stops partials and transcribes all audio. Throws on failure so the caller can fall back.

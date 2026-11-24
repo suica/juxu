@@ -385,18 +385,18 @@ final class VoiceHUDContentView: NSView {
         let fitted = VoiceHUDTextFit.tailFitting(
             text,
             attrs: attrs,
-            width: maxTextWidth - 2,
+            width: maxTextWidth - 8,
             lineHeight: metrics.cardLineHeight,
             maxLines: 2
         )
-        let natural = ceil((fitted as NSString).size(withAttributes: attrs).width) + 3
+        let natural = ceil((fitted as NSString).size(withAttributes: attrs).width) + 8
         // Grow in steps and never shrink during an utterance, so the card does not jitter.
         let stepped = min(maxTextWidth, ceil(natural / 24) * 24)
         cardWidthFloor = max(cardWidthFloor, stepped)
         let lines = VoiceHUDTextFit.lineCount(
             fitted,
             attrs: attrs,
-            width: cardWidthFloor - 2,
+            width: cardWidthFloor - 8,
             lineHeight: metrics.cardLineHeight
         )
         cardLinesFloor = max(cardLinesFloor, min(2, lines))
