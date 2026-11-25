@@ -131,7 +131,8 @@ enum VoiceContextPromptTests {
         precondition(qwen.count <= VoiceASRContextTarget.qwen.characterBudget)
         precondition(qwen.hasPrefix("#engineering\n"), "Qwen gets the window title: \(qwen)")
         precondition(qwen.contains("句序 Typeless RWKV-7"), "Qwen gets the vocabulary first: \(qwen)")
-        precondition(qwen.contains("VoiceContextCapture") && qwen.contains("WhisperKit"), "Qwen gets screen and cursor terms: \(qwen)")
+        precondition(qwen.contains("WhisperKit") && qwen.contains("MLX"), "Qwen gets cursor and surrounding terms: \(qwen)")
+        precondition(!qwen.contains("VoiceContextCapture") && !qwen.contains("Alice"), "Qwen gets no terms from the whole screen: \(qwen)")
         precondition(qwen.hasSuffix("我看了一下 WhisperKit 和 Qwen3-ASR 的对比，"), "Qwen gets the text before the cursor: \(qwen)")
 
         let whisper = VoiceASRContextBuilder.recognitionContext(ctx, target: .whisper, language: "zh") ?? ""
@@ -159,6 +160,15 @@ enum VoiceContextPromptTests {
         precondition(VoiceASRContextTarget.cloud(model: "gpt-4o-mini-transcribe").characterBudget == 400)
         precondition(VoiceASRContextTarget.cloud(model: "whisper-large-v3-turbo").characterBudget == 160)
 
+        // Unrelated words on screen pulled Qwen3-ASR towards them in testing, so no recogniser prompt reads the screen.
+        let noisy = VoiceContext(personalVocabulary: ["句序"]).merged(with: captured(screen: "Kubernetes Terraform Grafana Prometheus"))
+        for target in [VoiceASRContextTarget.qwen, .whisper, .cloud(model: "gpt-4o-mini-transcribe")] {
+            let text = VoiceASRContextBuilder.recognitionContext(noisy, target: target, language: "zh") ?? ""
+            precondition(!text.contains("Kubernetes") && !text.contains("Grafana"), "\(target) ignores screen-only terms: \(text)")
+        }
+        precondition(VoiceASRContextBuilder.contextualStrings(noisy).contains("Kubernetes"), "Apple Speech phrases still read the screen")
+        precondition(VoicePolishContextBuilder.referenceBlock(noisy, budget: .compact).contains("Kubernetes"), "compact polish still reads the screen")
+
         let phrases = VoiceASRContextBuilder.contextualStrings(ctx)
         precondition(Array(phrases.prefix(3)) == vocab, "Apple Speech gets the vocabulary first: \(phrases)")
         precondition(phrases.contains("VoiceContextCapture") && phrases.contains("MLX"), "then terms on screen: \(phrases)")
@@ -173,39 +183,77 @@ enum VoiceContextPromptTests {
 
     static func privacy() {
         let vocab = ["句序"]
-        let secrets = ["WhisperKit", "VoiceContextCapture", "engineering", "明天再说", "MLX"]
-        func leaks(_ text: String?) -> [String] {
-            guard let text else { return [] }
-            return secrets.filter { text.contains($0) }
+        let targets = [VoiceASRContextTarget.qwen, .whisper, .cloud(model: "gpt-4o-mini-transcribe")]
+        func allPolish(_ ctx: VoiceContext, _ budget: VoicePolishContextBudget) -> String {
+            VoicePromptBuilder.polishMessages(rawTranscript: "测试", toneMode: .autoByApp, context: ctx, budget: budget)
+                .compactMap { $0["content"] }.joined(separator: "\n")
         }
-        let cases: [(String, VoiceContext)] = [
+
+        // Secure fields and password managers: nothing but the vocabulary leaves the input method.
+        let everything = ["WhisperKit", "VoiceContextCapture", "engineering", "明天再说", "MLX", "Alice"]
+        func leaks(_ text: String?, _ words: [String]) -> [String] {
+            guard let text else { return [] }
+            return words.filter { text.contains($0) }
+        }
+        let hard: [(String, VoiceContext)] = [
             ("secure field", VoiceContext(personalVocabulary: vocab).merged(with: captured(secure: true))),
-            ("blacklisted capture", VoiceContext(personalVocabulary: vocab).merged(with: captured(blacklisted: true))),
             ("password manager", VoiceContext(
                 bundleIdentifier: "com.1password.1password",
+                windowTitle: "engineering",
                 beforeContext: "WhisperKit VoiceContextCapture",
+                afterContext: "明天再说",
                 personalVocabulary: vocab
             )),
-            ("blacklisted before capture", VoiceContext(
-                bundleIdentifier: "com.tencent.xinWeChat",
-                windowTitle: "engineering",
-                beforeContext: "WhisperKit MLX",
-                personalVocabulary: vocab
-            ).restricted(true)),
         ]
-        for (name, ctx) in cases {
-            precondition(!ctx.allowsScreenContext, "\(name) is gated")
-            for target in [VoiceASRContextTarget.qwen, .whisper, .cloud(model: "gpt-4o-mini-transcribe")] {
+        for (name, ctx) in hard {
+            precondition(!ctx.allowsCursorContext && !ctx.allowsScreenContext, "\(name) is fully gated")
+            for target in targets {
                 let text = VoiceASRContextBuilder.recognitionContext(ctx, target: target, language: "zh")
-                precondition(leaks(text).isEmpty, "\(name) leaks \(leaks(text)) to \(target)")
+                precondition(leaks(text, everything).isEmpty, "\(name) leaks \(leaks(text, everything)) to \(target)")
                 precondition(text?.contains("句序") == true, "\(name) still sends the vocabulary to \(target)")
             }
             precondition(VoiceASRContextBuilder.contextualStrings(ctx) == vocab, "\(name): Apple Speech gets only the vocabulary")
             for budget in [VoicePolishContextBudget.full, .compact] {
-                let messages = VoicePromptBuilder.polishMessages(rawTranscript: "测试", toneMode: .autoByApp, context: ctx, budget: budget)
-                let all = messages.compactMap { $0["content"] }.joined(separator: "\n")
-                precondition(leaks(all).isEmpty, "\(name) leaks \(leaks(all)) to polish (\(budget))")
+                let all = allPolish(ctx, budget)
+                precondition(leaks(all, everything).isEmpty, "\(name) leaks \(leaks(all, everything)) to polish (\(budget))")
                 precondition(all.contains("句序"), "\(name) keeps the vocabulary in polish")
+            }
+        }
+
+        // Blacklisted apps and pages: the cursor state is still read there, so window, cursor text and
+        // selection stay; the URL, the surrounding text and the screen do not.
+        let screenOnly = ["VoiceContextCapture", "Alice", "MLX", "Bob", "docs.google.com"]
+        let soft: [(String, VoiceContext)] = [
+            ("blacklisted capture", VoiceContext(personalVocabulary: vocab).merged(
+                with: captured(url: "https://docs.google.com/document/d/abc", blacklisted: true)
+            )),
+            ("blacklisted before capture", VoiceContext(
+                bundleIdentifier: "com.tencent.xinWeChat",
+                windowTitle: "#engineering",
+                webURL: "https://docs.google.com/document/d/abc",
+                beforeContext: "我看了一下 WhisperKit 的对比，",
+                afterContext: "明天再说",
+                surroundingBefore: "Bob: MLX",
+                visibleScreenText: "Alice: VoiceContextCapture",
+                personalVocabulary: vocab
+            ).restricted(true)),
+        ]
+        for (name, ctx) in soft {
+            precondition(ctx.allowsCursorContext && !ctx.allowsScreenContext, "\(name) gates only the screen")
+            for target in targets {
+                let text = VoiceASRContextBuilder.recognitionContext(ctx, target: target, language: "zh") ?? ""
+                precondition(leaks(text, screenOnly).isEmpty, "\(name) leaks \(leaks(text, screenOnly)) to \(target)")
+                precondition(text.contains("句序") && text.contains("WhisperKit"), "\(name) keeps vocabulary and cursor text for \(target): \(text)")
+            }
+            let qwen = VoiceASRContextBuilder.recognitionContext(ctx, target: .qwen, language: "zh") ?? ""
+            precondition(qwen.hasPrefix("#engineering"), "\(name) keeps the window title: \(qwen)")
+            let phrases = VoiceASRContextBuilder.contextualStrings(ctx)
+            precondition(leaks(phrases.joined(separator: " "), screenOnly).isEmpty && phrases.contains("WhisperKit"), "\(name): \(phrases)")
+            for budget in [VoicePolishContextBudget.full, .compact] {
+                let all = allPolish(ctx, budget)
+                precondition(leaks(all, screenOnly).isEmpty, "\(name) leaks \(leaks(all, screenOnly)) to polish (\(budget))")
+                precondition(all.contains("光标前文：") && all.contains("WhisperKit") && all.contains("光标后文：明天再说"), "\(name) keeps cursor text in polish (\(budget))")
+                precondition(all.contains("#engineering") && !all.contains("网址"), "\(name) keeps the window, not the URL (\(budget))")
             }
         }
 

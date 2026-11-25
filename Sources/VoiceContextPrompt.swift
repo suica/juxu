@@ -1,8 +1,8 @@
 import Foundation
 
 // Turns the captured `VoiceContext` into what each recogniser and the polish model may see.
-// Every builder starts from `promptSafe()`, so a secure field, a password manager or a blacklisted
-// app or page sends no screen or cursor text anywhere; only the personal vocabulary is kept.
+// Every builder starts from `promptSafe()`: a secure field or a password manager sends nothing but the
+// personal vocabulary, and a blacklisted app or page sends no screen or surrounding text.
 
 // MARK: - Privacy gate
 
@@ -16,20 +16,26 @@ extension VoiceContext {
         return false
     }
 
-    /// Whether window, URL, cursor, surrounding and screen text may reach a recogniser or the polish model.
+    /// Whether the window title, the selection and the text around the cursor may leave the input method.
+    public var allowsCursorContext: Bool { !isSecureOrHardBlocked }
+
+    /// Whether the URL, the text around the input area and the visible screen may leave the input method.
+    /// The blacklist exists to keep those large reads away from some apps and pages; the cursor state is still read there.
     public var allowsScreenContext: Bool {
-        !policyRestricted && !isSecureOrHardBlocked && captured?.contextMetadata.isBlacklisted != true
+        allowsCursorContext && !policyRestricted && captured?.contextMetadata.isBlacklisted != true
     }
 
     /// The context with everything the privacy gate forbids removed.
-    /// The selection survives a blacklisted app, because speak-to-edit sends it on purpose,
-    /// but never a secure field or a password manager.
     public func promptSafe() -> VoiceContext {
         if allowsScreenContext { return self }
+        let cursor = allowsCursorContext
         return VoiceContext(
             bundleIdentifier: bundleIdentifier,
             appName: appName,
-            selectedText: isSecureOrHardBlocked ? nil : selectedText,
+            windowTitle: cursor ? windowTitle : nil,
+            selectedText: cursor ? selectedText : nil,
+            beforeContext: cursor ? beforeContext : nil,
+            afterContext: cursor ? afterContext : nil,
             personalVocabulary: personalVocabulary,
             captured: nil,
             policyRestricted: true
@@ -258,20 +264,21 @@ public enum VoiceContextTerms {
         return Array(ranked.prefix(limit).map(\.term))
     }
 
-    /// Terms from every context field, cursor and window first.
-    public static func fromContext(_ context: VoiceContext, limit: Int) -> [String] {
+    /// Terms from the context fields the privacy gate allows, cursor and window first.
+    /// `includeScreen` adds the whole visible screen, which is too noisy for the recognisers' own context:
+    /// unrelated words on screen pulled Qwen3-ASR towards them in testing.
+    public static func fromContext(_ context: VoiceContext, limit: Int, includeScreen: Bool) -> [String] {
         let ctx = context.promptSafe()
-        var sources: [(text: String, weight: Int)] = []
-        if ctx.allowsScreenContext {
-            sources = [
-                (VoiceContextText.singleLine(ctx.windowTitle), 3),
-                (VoiceContextText.tail(VoiceContextText.clean(ctx.beforeContext), 600), 3),
-                (VoiceContextText.head(VoiceContextText.clean(ctx.afterContext), 300), 3),
-                (VoiceContextText.clean(ctx.selectedText), 3),
-                (VoiceContextText.tail(VoiceContextText.clean(ctx.surroundingBefore), 800), 2),
-                (VoiceContextText.head(VoiceContextText.clean(ctx.surroundingAfter), 600), 2),
-                (VoiceContextText.clean(ctx.visibleScreenText), 1),
-            ]
+        var sources: [(text: String, weight: Int)] = [
+            (VoiceContextText.singleLine(ctx.windowTitle), 3),
+            (VoiceContextText.tail(VoiceContextText.clean(ctx.beforeContext), 600), 3),
+            (VoiceContextText.head(VoiceContextText.clean(ctx.afterContext), 300), 3),
+            (VoiceContextText.clean(ctx.selectedText), 3),
+            (VoiceContextText.tail(VoiceContextText.clean(ctx.surroundingBefore), 800), 2),
+            (VoiceContextText.head(VoiceContextText.clean(ctx.surroundingAfter), 600), 2),
+        ]
+        if includeScreen {
+            sources.append((VoiceContextText.clean(ctx.visibleScreenText), 1))
         }
         var excluded = ctx.personalVocabulary
         if let app = ctx.appName { excluded.append(app) }
@@ -323,7 +330,7 @@ public enum VoiceASRContextBuilder {
         let budget = target.characterBudget
         let vocabulary = VoicePromptBuilder.deduplicatedVocabulary(ctx.personalVocabulary, limit: 40)
             .filter { $0.count <= 40 }
-        let terms = VoiceContextTerms.fromContext(ctx, limit: 16)
+        let terms = VoiceContextTerms.fromContext(ctx, limit: 16, includeScreen: false)
         let before = VoiceContextText.singleLine(ctx.beforeContext)
 
         switch target {
@@ -360,7 +367,7 @@ public enum VoiceASRContextBuilder {
         let ctx = context.promptSafe()
         let vocabulary = VoicePromptBuilder.deduplicatedVocabulary(ctx.personalVocabulary, limit: 60)
             .filter { $0.count <= 40 }
-        let terms = VoiceContextTerms.fromContext(ctx, limit: max(0, limit - vocabulary.count))
+        let terms = VoiceContextTerms.fromContext(ctx, limit: max(0, limit - vocabulary.count), includeScreen: true)
         return Array((vocabulary + terms).prefix(limit))
     }
 
@@ -422,7 +429,7 @@ public enum VoicePolishContextBuilder {
             let afterText = VoiceContextText.head(VoiceContextText.singleLine(after), 40)
             if !beforeText.isEmpty { lines.append("光标前文：\(beforeText)") }
             if !afterText.isEmpty { lines.append("光标后文：\(afterText)") }
-            let terms = VoiceContextTerms.fromContext(ctx, limit: 12)
+            let terms = VoiceContextTerms.fromContext(ctx, limit: 12, includeScreen: true)
             if !terms.isEmpty { lines.append("屏幕关键词：\(terms.joined(separator: "、"))") }
         }
         return wrap(lines)
