@@ -460,3 +460,66 @@ public enum VoicePolishContextBuilder {
         return out.joined(separator: "\n")
     }
 }
+
+// MARK: - Inspector preview
+
+/// Renders the exact context strings sent to the active ASR and polish models for the settings inspector.
+public struct VoiceContextPromptPreview: Equatable, Sendable {
+    public let asrTargetLabel: String
+    public let asrContext: String
+    public let polishBudgetLabel: String
+    public let polishContext: String
+
+    public static func build(context: VoiceContext, prefs: VoicePreferences) -> VoiceContextPromptPreview {
+        let asrTargetLabel: String
+        let asrContext: String
+        switch prefs.providerMode {
+        case .cloudBYOK:
+            let model = prefs.effectiveCloudASRModel
+            let target = VoiceASRContextTarget.cloud(model: model)
+            asrTargetLabel = "\(model) · 上限 \(target.characterBudget) 字"
+            asrContext = VoiceASRContextBuilder.recognitionContext(context, target: target, language: prefs.language) ?? ""
+        case .local:
+            switch prefs.localASRPreset {
+            case .qwen3ASR:
+                asrTargetLabel = "Qwen3-ASR · 上限 \(VoiceASRContextTarget.qwen.characterBudget) 字"
+                asrContext = VoiceASRContextBuilder.recognitionContext(context, target: .qwen, language: prefs.language) ?? ""
+            case .whisperTurbo, .whisperBase:
+                asrTargetLabel = "Whisper · 上限 \(VoiceASRContextTarget.whisper.characterBudget) 字"
+                asrContext = VoiceASRContextBuilder.recognitionContext(context, target: .whisper, language: prefs.language) ?? ""
+            case .customHTTP:
+                let model = prefs.localHTTPASRModel
+                let target = VoiceASRContextTarget.cloud(model: model)
+                asrTargetLabel = "\(model) · 上限 \(target.characterBudget) 字"
+                asrContext = VoiceASRContextBuilder.recognitionContext(context, target: target, language: prefs.language) ?? ""
+            case .appleSpeech:
+                let phrases = VoiceASRContextBuilder.contextualStrings(context)
+                asrTargetLabel = "Apple Speech contextualStrings · \(phrases.count)/100 条"
+                asrContext = phrases.joined(separator: "、")
+            }
+        }
+
+        let polishEnabled: Bool
+        let budget: VoicePolishContextBudget
+        switch prefs.providerMode {
+        case .cloudBYOK:
+            polishEnabled = prefs.outputMode != .rawDictation && prefs.cloudPolishEnabled
+            budget = .full
+        case .local:
+            polishEnabled = prefs.outputMode != .rawDictation && prefs.localLLMPreset != .none
+            budget = .compact
+        }
+        let budgetName = budget == .full ? "full" : "compact"
+        let polishBudgetLabel = polishEnabled
+            ? "AI 润色（\(budgetName)）"
+            : "AI 润色未开启（预览 · \(budgetName)）"
+        let polishContext = VoicePolishContextBuilder.referenceBlock(context, budget: budget)
+
+        return VoiceContextPromptPreview(
+            asrTargetLabel: asrTargetLabel,
+            asrContext: asrContext,
+            polishBudgetLabel: polishBudgetLabel,
+            polishContext: polishContext
+        )
+    }
+}

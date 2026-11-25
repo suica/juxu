@@ -76,10 +76,16 @@ public struct VoiceSettingsView: View {
                     )
                 }
                 triggerAndBehaviorCard
-                VoiceContextInspectorCard(inspector: VoiceContextInspectorStore.shared)
+                VoiceContextInspectorCard(
+                    inspector: VoiceContextInspectorStore.shared,
+                    voiceStore: voiceStore
+                )
                 vocabularyAndTestCard
             } else {
-                VoiceContextInspectorCard(inspector: VoiceContextInspectorStore.shared)
+                VoiceContextInspectorCard(
+                    inspector: VoiceContextInspectorStore.shared,
+                    voiceStore: voiceStore
+                )
             }
         }
         .onAppear {
@@ -765,9 +771,29 @@ private struct LocalVoiceConfigCard: View {
 /// Interactive tester & inspector for Typeless-style AXUIElement + AXEnhancedUserInterface context capture.
 private struct VoiceContextInspectorCard: View {
     @ObservedObject var inspector: VoiceContextInspectorStore
-    @State private var showRawJSON = true
+    @ObservedObject var voiceStore: VoicePreferencesStore
+    @State private var showRawJSON = false
     @State private var copiedNotice = false
+    @State private var copiedASRNotice = false
     @State private var axTrusted = AXIsProcessTrusted()
+
+    private func resolvedPreview(for captured: VoiceCapturedContext) -> VoiceContextPromptPreview {
+        if !inspector.lastASRTargetLabel.isEmpty {
+            return VoiceContextPromptPreview(
+                asrTargetLabel: inspector.lastASRTargetLabel,
+                asrContext: inspector.lastASRContext,
+                polishBudgetLabel: inspector.lastPolishBudgetLabel,
+                polishContext: inspector.lastPolishContext
+            )
+        }
+        let prefs = voiceStore.prefs
+        var vocab = prefs.parsedCustomVocabulary
+        if prefs.syncJuxuLexicon {
+            vocab.append(contentsOf: JuxuBridge.shared.userPhrases.prefix(40).map(\.text))
+        }
+        let ctx = VoiceContext(personalVocabulary: vocab).merged(with: captured)
+        return VoiceContextPromptPreview.build(context: ctx, prefs: prefs)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -862,6 +888,60 @@ private struct VoiceContextInspectorCard: View {
                     }
                     let visCount = app.visibleScreenContent?.count ?? 0
                     summaryRow("屏幕可见文本", visCount > 0 ? "\(visCount) 字：\(compactPreview(app.visibleScreenContent ?? "", limit: 80))" : (meta.isBlacklisted ? "黑名单跳过" : "无"))
+                }
+
+                let preview = resolvedPreview(for: captured)
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text("实际送给 ASR 模型的上下文")
+                            .font(.system(size: 11.5, weight: .semibold))
+                        Text("\(preview.asrTargetLabel) · 实发 \(preview.asrContext.count) 字")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if !preview.asrContext.isEmpty {
+                            Button(copiedASRNotice ? "已复制" : "复制") {
+                                let pb = NSPasteboard.general
+                                pb.clearContents()
+                                pb.setString(preview.asrContext, forType: .string)
+                                copiedASRNotice = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                                    copiedASRNotice = false
+                                }
+                            }
+                            .controlSize(.mini)
+                        }
+                    }
+                    ScrollView(.vertical) {
+                        Text(preview.asrContext.isEmpty ? "（无上下文发送）" : preview.asrContext)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(preview.asrContext.isEmpty ? .secondary : .primary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(minHeight: 36, maxHeight: 110)
+                    .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                    HStack(spacing: 8) {
+                        Text("实际送给润色模型的上下文")
+                            .font(.system(size: 11.5, weight: .semibold))
+                        Text("\(preview.polishBudgetLabel) · \(preview.polishContext.count) 字")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    ScrollView(.vertical) {
+                        Text(preview.polishContext.isEmpty ? "（无参考上下文）" : preview.polishContext)
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(preview.polishContext.isEmpty ? .secondary : .primary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(minHeight: 32, maxHeight: 100)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
 
                 if showRawJSON {

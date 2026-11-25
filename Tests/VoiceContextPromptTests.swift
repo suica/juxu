@@ -88,6 +88,7 @@ enum VoiceContextPromptTests {
         polish()
         engines()
         session()
+        preview()
         print("✓ Voice ASR & polish context tests passed")
     }
 
@@ -403,5 +404,30 @@ enum VoiceContextPromptTests {
         }
         precondition(VoiceSessionController.contextCaptureGrace <= 0.3, "release is never held up for long")
         VoiceSessionController.unload()
+    }
+
+    static func preview() {
+        let ctx = VoiceContext(personalVocabulary: ["句序", "Typeless"]).merged(with: captured())
+        var prefs = VoicePreferences()
+        prefs.providerMode = .local
+        prefs.localASRPreset = .qwen3ASR
+        prefs.localLLMPreset = .none
+        let qwen = VoiceContextPromptPreview.build(context: ctx, prefs: prefs)
+        precondition(qwen.asrTargetLabel.contains("Qwen3-ASR") && qwen.asrContext.contains("#engineering") && qwen.asrContext.contains("Typeless"))
+        precondition(qwen.polishBudgetLabel.contains("未开启") && qwen.polishContext.contains("【参考上下文】"))
+
+        prefs.localASRPreset = .whisperTurbo
+        let whisper = VoiceContextPromptPreview.build(context: ctx, prefs: prefs)
+        precondition(whisper.asrTargetLabel.contains("Whisper") && whisper.asrContext.count <= 120)
+
+        prefs.localASRPreset = .appleSpeech
+        let apple = VoiceContextPromptPreview.build(context: ctx, prefs: prefs)
+        precondition(apple.asrTargetLabel.contains("Apple Speech") && apple.asrContext.contains("VoiceContextCapture"))
+
+        prefs.providerMode = .cloudBYOK
+        prefs.cloudPreset = .openai
+        prefs.cloudPolishEnabled = true
+        let cloud = VoiceContextPromptPreview.build(context: ctx, prefs: prefs)
+        precondition(cloud.asrTargetLabel.contains("400") && cloud.polishBudgetLabel.contains("full") && !cloud.polishBudgetLabel.contains("未开启"))
     }
 }

@@ -468,6 +468,16 @@ public final class VoiceSessionController {
     func applyCapturedContext(_ captured: VoiceCapturedContext) {
         activeContext = activeContext.merged(with: captured)
         activeEngine?.updateContext(activeContext)
+        let preview = VoiceContextPromptPreview.build(
+            context: activeContext,
+            prefs: VoicePreferencesStore.shared.prefs
+        )
+        VoiceContextInspectorStore.shared.recordModelContext(
+            asrTargetLabel: preview.asrTargetLabel,
+            asrContext: preview.asrContext,
+            polishBudgetLabel: preview.polishBudgetLabel,
+            polishContext: preview.polishContext
+        )
     }
 
     /// Lets a capture that is about to land reach the final pass, never holding the release up by more than `maxWait`.

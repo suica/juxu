@@ -1588,6 +1588,10 @@ public final class VoiceContextInspectorStore: ObservableObject {
 
     @Published public private(set) var lastCaptured: VoiceCapturedContext?
     @Published public private(set) var lastJSON: String = ""
+    @Published public private(set) var lastASRTargetLabel: String = ""
+    @Published public private(set) var lastASRContext: String = ""
+    @Published public private(set) var lastPolishBudgetLabel: String = ""
+    @Published public private(set) var lastPolishContext: String = ""
     @Published public private(set) var countdownSeconds: Int = 0
     @Published public private(set) var isCapturing: Bool = false
     @Published public var respectBlacklist: Bool = true
@@ -1599,6 +1603,22 @@ public final class VoiceContextInspectorStore: ObservableObject {
     public func record(_ captured: VoiceCapturedContext) {
         self.lastCaptured = captured
         self.lastJSON = captured.prettyJSON()
+        self.lastASRTargetLabel = ""
+        self.lastASRContext = ""
+        self.lastPolishBudgetLabel = ""
+        self.lastPolishContext = ""
+    }
+
+    public func recordModelContext(
+        asrTargetLabel: String,
+        asrContext: String,
+        polishBudgetLabel: String,
+        polishContext: String
+    ) {
+        self.lastASRTargetLabel = asrTargetLabel
+        self.lastASRContext = asrContext
+        self.lastPolishBudgetLabel = polishBudgetLabel
+        self.lastPolishContext = polishContext
     }
 
     public func captureAfterDelay(seconds: Int = 3) {
