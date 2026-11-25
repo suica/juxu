@@ -2452,4 +2452,38 @@ fn real_dicts_archaic_polyphone_does_not_hijack_common_words() {
             "ctx={ctx:?} uade must not surface TOK_UNK 唼 in top5, got {top5:?}"
         );
     }
+
+    // 5. Personalization interpolation must NOT clamp `TOK_UNK` (`-22`) back up to `-13.81`
+    //    when `context` has recorded continuations for other characters (`best_p == 0.0`).
+    for k in 0..3u64 {
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::XiaoheShuangpin;
+        engine.set_config(cfg);
+        engine.clear_context();
+        engine.clear_composition();
+        for (i, ch) in "hvyiui".chars().enumerate() {
+            engine.handle_key_event(0, Some(ch), false, 8_000 + k * 500 + i as u64 * 80);
+        }
+        let _ = engine.handle_key_event(KEY_SPACE, Some(' '), false, 8_480 + k * 500);
+    }
+    engine.clear_composition();
+    engine.set_recent_context("会议");
+    for (i, ch) in "uade".chars().enumerate() {
+        engine.handle_key_event(0, Some(ch), false, 10_000 + i as u64 * 90);
+    }
+    let top5_pers: Vec<String> = engine
+        .all_candidates()
+        .iter()
+        .take(5)
+        .map(|c| c.text.clone())
+        .collect();
+    assert_eq!(
+        top5_pers.first().map(String::as_str),
+        Some("啥的"),
+        "personalized ctx=\"会议\" uade expected 啥的 at #1, got {top5_pers:?}"
+    );
+    assert!(
+        !top5_pers.iter().any(|t| t.contains('唼')),
+        "personalized ctx=\"会议\" uade must not surface TOK_UNK 唼, got {top5_pers:?}"
+    );
 }

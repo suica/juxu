@@ -591,8 +591,11 @@ impl PersonalContinuations {
         if best_lambda <= 1e-4 {
             return rwkv_logp;
         }
-        let p_rwkv = rwkv_logp.clamp(-13.5, -0.001).exp();
-        let p_final = ((1.0 - best_lambda) * p_rwkv + best_lambda * best_p).clamp(1e-6, 0.999);
+        if best_p <= 0.0 {
+            return rwkv_logp + (1.0 - best_lambda).max(1e-6).ln();
+        }
+        let p_rwkv = rwkv_logp.clamp(-30.0, -0.001).exp();
+        let p_final = ((1.0 - best_lambda) * p_rwkv + best_lambda * best_p).clamp(1e-13, 0.999);
         p_final.ln()
     }
 
