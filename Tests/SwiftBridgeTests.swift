@@ -966,6 +966,8 @@ struct SwiftBridgeTests {
         assert(mergedCtx.afterContext == "now")
         assert(mergedCtx.visibleScreenText == "Alice: check CI")
 
+        VoiceContextPromptTests.run()
+
         print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W, VoiceContextCapture & macOS Voice MVP tests passed!")
     }
 }

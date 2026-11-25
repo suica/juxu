@@ -86,6 +86,22 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
         self.context = context?.isEmpty == true ? nil : context
     }
 
+    /// Takes effect from the next pass: a partial already in flight keeps the context it was sent with.
+    public func updateContext(_ context: VoiceContext) {
+        self.context = VoiceASRContextBuilder.recognitionContext(context, target: .qwen, language: "")
+    }
+
+    /// The context string the next request carries.
+    var currentContext: String? { context }
+
+    /// The JSON line that precedes a job's PCM samples on the helper's stdin.
+    static func requestHeader(id: Int, isFinal: Bool, sampleCount: Int, language: String, context: String?) -> [String: Any] {
+        var request: [String: Any] = ["id": id, "kind": isFinal ? "final" : "partial", "samples": sampleCount]
+        if let name = modelLanguage(language) { request["language"] = name }
+        if let context, !context.isEmpty { request["context"] = context }
+        return request
+    }
+
     public func beginSession() {
         activeSessions += 1
         idleItem?.cancel()
@@ -114,6 +130,15 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
     }
 
     public func transcribe(wavData: Data, language: String, timeout: TimeInterval, isFinal: Bool) async throws -> String {
+        let sentContext = context
+        let text = try await run(wavData: wavData, language: language, timeout: timeout, isFinal: isFinal, context: sentContext)
+        guard VoiceASRContextBuilder.isPromptEcho(text, prompt: sentContext) else { return text }
+        // The model read the context back instead of the speech: a partial is dropped, a final is redone without it.
+        guard isFinal else { return "" }
+        return try await run(wavData: wavData, language: language, timeout: timeout, isFinal: true, context: nil)
+    }
+
+    private func run(wavData: Data, language: String, timeout: TimeInterval, isFinal: Bool, context: String?) async throws -> String {
         try await ensureReady()
         try Task.checkCancellation()
         guard let current = connection else { throw VoiceEngineError.cliFailed("Qwen 引擎未运行") }
@@ -121,9 +146,7 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
         let pcm = wavData.dropFirst(44)
         let id = nextID
         nextID += 1
-        var request: [String: Any] = ["id": id, "kind": isFinal ? "final" : "partial", "samples": pcm.count / 2]
-        if let name = Self.modelLanguage(language) { request["language"] = name }
-        if let context { request["context"] = context }
+        let request = Self.requestHeader(id: id, isFinal: isFinal, sampleCount: pcm.count / 2, language: language, context: context)
         var payload = try JSONSerialization.data(withJSONObject: request)
         payload.append(0x0A)
         payload.append(pcm)

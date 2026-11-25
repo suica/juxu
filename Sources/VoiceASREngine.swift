@@ -14,6 +14,8 @@ public protocol VoiceASREngine: AnyObject {
     func endSession()
     func prepare() async throws
     func transcribe(wavData: Data, language: String, timeout: TimeInterval, isFinal: Bool) async throws -> String
+    /// Replaces what the next passes are biased with; called again when the AX capture finishes mid-recording.
+    func updateContext(_ context: VoiceContext)
     func release()
 }
 
@@ -29,9 +31,9 @@ public enum VoiceASRExecutorID: Sendable {
 protocol VoiceASRExecutor {
     /// The program this executor needs, or nil when it is missing.
     func dependencyPath() -> String?
-    func makeEngine(modelPath: String, language: String, vocabulary: [String]) -> VoiceASREngine?
+    func makeEngine(modelPath: String, language: String, context: VoiceContext) -> VoiceASREngine?
     /// One-shot transcription without a resident model; nil when the executor has none.
-    func transcribeOnce(dependency: String, modelPath: String, language: String, wavData: Data, client: VoicePipelineClient) async throws -> String?
+    func transcribeOnce(dependency: String, modelPath: String, language: String, context: VoiceContext, wavData: Data, client: VoicePipelineClient) async throws -> String?
     func stop()
     func unload()
 }
@@ -219,12 +221,12 @@ public enum VoiceASRRegistry {
     }
 
     /// The resident engine for the selected model, or nil when it is not ready to run.
-    public static func engine(for prefs: VoicePreferences, vocabulary: [String]) -> VoiceASREngine? {
+    public static func engine(for prefs: VoicePreferences, context: VoiceContext) -> VoiceASREngine? {
         let preset = prefs.localASRPreset
         guard let id = preset.descriptor.executor else { return nil }
         let status = VoiceLocalInstaller.asrStatus(for: preset)
         guard status.isReady, let modelPath = status.modelPath else { return nil }
-        return executor(id).makeEngine(modelPath: modelPath, language: prefs.language, vocabulary: vocabulary)
+        return executor(id).makeEngine(modelPath: modelPath, language: prefs.language, context: context)
     }
 
     /// Transcribes with the selected model if it has a one-shot path, otherwise with an installed
@@ -232,7 +234,8 @@ public enum VoiceASRRegistry {
     public static func transcribeWithFallback(
         prefs: VoicePreferences,
         client: VoicePipelineClient,
-        wavData: Data
+        wavData: Data,
+        context: VoiceContext
     ) async throws -> String {
         let fallbacks = VoiceLocalASRModelPreset.allCases
             .filter { $0.descriptor.fallbackRank != nil && $0 != prefs.localASRPreset }
@@ -245,6 +248,7 @@ public enum VoiceASRRegistry {
                 dependency: dependency,
                 modelPath: modelPath,
                 language: prefs.language,
+                context: context,
                 wavData: wavData,
                 client: client
             ) {
@@ -269,15 +273,21 @@ public enum VoiceASRRegistry {
 struct VoiceWhisperExecutor: VoiceASRExecutor {
     func dependencyPath() -> String? { VoiceLocalInstaller.detectWhisperCLIBinary() }
 
-    func makeEngine(modelPath: String, language: String, vocabulary: [String]) -> VoiceASREngine? {
+    func makeEngine(modelPath: String, language: String, context: VoiceContext) -> VoiceASREngine? {
         guard let server = VoiceWhisperServerManager.detectServerBinary() else { return nil }
         let manager = VoiceWhisperServerManager.shared
         manager.configure(binaryPath: server, modelPath: modelPath, language: language)
+        manager.updateContext(context)
         return manager
     }
 
-    func transcribeOnce(dependency: String, modelPath: String, language: String, wavData: Data, client: VoicePipelineClient) async throws -> String? {
-        try await client.transcribeLocalCLI(binaryPath: dependency, modelPath: modelPath, language: language, wavData: wavData)
+    func transcribeOnce(dependency: String, modelPath: String, language: String, context: VoiceContext, wavData: Data, client: VoicePipelineClient) async throws -> String? {
+        let prompt = VoiceASRContextBuilder.recognitionContext(context, target: .whisper, language: language)
+        let text = try await client.transcribeLocalCLI(
+            binaryPath: dependency, modelPath: modelPath, language: language, prompt: prompt, wavData: wavData
+        )
+        guard VoiceASRContextBuilder.isPromptEcho(text, prompt: prompt) else { return text }
+        return try await client.transcribeLocalCLI(binaryPath: dependency, modelPath: modelPath, language: language, wavData: wavData)
     }
 
     func stop() { VoiceWhisperServerManager.sharedIfLoaded?.stop() }
@@ -290,14 +300,15 @@ struct VoiceWhisperExecutor: VoiceASRExecutor {
 struct VoiceQwenExecutor: VoiceASRExecutor {
     func dependencyPath() -> String? { VoiceQwenHelperManager.helperBinaryPath() }
 
-    func makeEngine(modelPath: String, language: String, vocabulary: [String]) -> VoiceASREngine? {
+    func makeEngine(modelPath: String, language: String, context: VoiceContext) -> VoiceASREngine? {
         let manager = VoiceQwenHelperManager.shared
         manager.configure(modelDirectory: modelPath, context: nil)
+        manager.updateContext(context)
         return manager
     }
 
     /// The helper is the only Qwen path, so a failure here goes to the next installed model.
-    func transcribeOnce(dependency: String, modelPath: String, language: String, wavData: Data, client: VoicePipelineClient) async throws -> String? {
+    func transcribeOnce(dependency: String, modelPath: String, language: String, context: VoiceContext, wavData: Data, client: VoicePipelineClient) async throws -> String? {
         nil
     }
 
