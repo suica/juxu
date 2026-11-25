@@ -796,7 +796,8 @@ public final class VoiceWhisperStreamSession {
                 lastTotal = total
                 onPassStarted?()
                 let passStart = Date()
-                let wav = VoiceWAVEncoder.encodePCM16Mono(samples: voiced, sampleRate: VoiceWhisperStreamPolicy.sampleRate)
+                let conditioned = VoiceAudioNormalizer.conditionForASR(voiced)
+                let wav = VoiceWAVEncoder.encodePCM16Mono(samples: conditioned, sampleRate: VoiceWhisperStreamPolicy.sampleRate)
                 do {
                     let text = try await transcriber.transcribe(
                         wavData: wav,

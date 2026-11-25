@@ -429,5 +429,25 @@ enum VoiceContextPromptTests {
         prefs.cloudPolishEnabled = true
         let cloud = VoiceContextPromptPreview.build(context: ctx, prefs: prefs)
         precondition(cloud.asrTargetLabel.contains("400") && cloud.polishBudgetLabel.contains("full") && !cloud.polishBudgetLabel.contains("未开启"))
+
+        // Audio normalizer: quiet 400 Hz speech (-28 dBFS) gets boosted cleanly; silence stays untouched; loud audio never clips.
+        let quiet = (0..<1600).map { i -> Int16 in
+            Int16((sin(2.0 * Double.pi * 400.0 * Double(i) / 16000.0) * 1200.0).rounded())
+        }
+        let boosted = VoiceAudioNormalizer.conditionForASR(quiet)
+        let boostedPeak = boosted.map { abs(Int($0)) }.max() ?? 0
+        precondition(boostedPeak >= 6000 && boostedPeak <= 26000, "quiet speech should be boosted cleanly: \(boostedPeak)")
+
+        let silence = [Int16](repeating: 40, count: 800)
+        let silenceOut = VoiceAudioNormalizer.conditionForASR(silence)
+        let silencePeak = silenceOut.map { abs(Int($0)) }.max() ?? 0
+        precondition(silencePeak <= 60, "DC silence should stay quiet: \(silencePeak)")
+
+        let loud = (0..<1600).map { i -> Int16 in
+            Int16((sin(2.0 * Double.pi * 400.0 * Double(i) / 16000.0) * 28000.0).rounded())
+        }
+        let loudOut = VoiceAudioNormalizer.conditionForASR(loud)
+        let loudPeak = loudOut.map { abs(Int($0)) }.max() ?? 0
+        precondition(loudPeak >= 24000 && loudPeak <= 32767, "loud speech stays unclipped: \(loudPeak)")
     }
 }

@@ -253,6 +253,68 @@ public enum VoicePromptBuilder {
     }
 }
 
+// MARK: - Audio Conditioning (High-Pass + Soft-Capped Auto Gain for Quiet Mics)
+
+public enum VoiceAudioNormalizer {
+    /// Removes sub-80 Hz rumble/DC and gently boosts quiet speech up to +18 dB without clipping or
+    /// amplifying room silence. Intended for 16 kHz mono PCM16 after `VoiceSpeechGate` has run.
+    public static func conditionForASR(_ samples: [Int16]) -> [Int16] {
+        let count = samples.count
+        guard count > 0 else { return [] }
+
+        // 1st-order high-pass filter (~80 Hz at 16 kHz) to strip DC offset and low-frequency fan/desk rumble.
+        let alpha: Float = 0.969
+        var filtered = [Float](repeating: 0, count: count)
+        var prevIn: Float = 0
+        var prevOut: Float = 0
+        var peak: Float = 0
+        var sumSq: Float = 0
+        let invScale: Float = 1.0 / 32768.0
+
+        for i in 0..<count {
+            let x = Float(samples[i]) * invScale
+            let y = x - prevIn + alpha * prevOut
+            prevIn = x
+            prevOut = y
+            filtered[i] = y
+            let a = abs(y)
+            if a > peak { peak = a }
+            sumSq += y * y
+        }
+
+        // Never boost pure silence / noise floor below -48 dBFS.
+        let minSpeechPeak: Float = 0.004
+        let targetPeak: Float = 0.70
+        let targetRMS: Float = 0.11
+        let maxGain: Float = 8.0 // +18 dB cap
+
+        let gain: Float
+        if peak >= minSpeechPeak && peak < targetPeak {
+            let rms = sqrt(sumSq / Float(count))
+            let peakGain = targetPeak / peak
+            let rmsGain = rms > 1e-5 ? (targetRMS / rms) * 1.6 : peakGain
+            gain = min(maxGain, max(1.0, min(peakGain, rmsGain)))
+        } else {
+            gain = 1.0
+        }
+
+        var out = [Int16](repeating: 0, count: count)
+        let knee: Float = 0.88
+        let headroom: Float = 1.0 - knee
+        for i in 0..<count {
+            var v = filtered[i] * gain
+            let a = abs(v)
+            if a > knee {
+                let limited = knee + headroom * tanh((a - knee) / headroom)
+                v = v >= 0 ? limited : -limited
+            }
+            let scaled = max(-32768.0, min(32767.0, (v * 32767.0).rounded()))
+            out[i] = Int16(scaled)
+        }
+        return out
+    }
+}
+
 // MARK: - WAV Encoder & Multipart Form Builder (16kHz Mono PCM16)
 
 public enum VoiceWAVEncoder {

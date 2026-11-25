@@ -818,7 +818,8 @@ public final class VoiceSessionController {
                             throw VoiceEngineError.noSpeechDetected
                         }
                     }
-                    let wavData = VoiceWAVEncoder.encodePCM16Mono(samples: audio, sampleRate: 16_000)
+                    let conditioned = VoiceAudioNormalizer.conditionForASR(audio)
+                    let wavData = VoiceWAVEncoder.encodePCM16Mono(samples: conditioned, sampleRate: 16_000)
                     var residentText: String?
                     if let stream {
                         do {
